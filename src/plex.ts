@@ -40,6 +40,37 @@ export const TRANSCRIPT_NAME = 'transcript'
 const PLEX_LIST_NAME = 'plex-list'
 
 /**
+ * The transcript container on its own.
+ *
+ * Exported so the assistant overlay can compose a page containing BOTH the
+ * transcript and its boxes without duplicating this geometry - two copies of
+ * the same layout constants would drift apart the first time either changes.
+ *
+ * `isEventCapture` is a parameter because only one container per page may
+ * capture events: it is 1 on the plain caption page, and 0 when an overlay
+ * box is up and needs the taps instead.
+ */
+export function transcriptContainer(
+  content: string,
+  isEventCapture = 1,
+  height = 288,
+): TextContainerProperty {
+  return new TextContainerProperty({
+    xPosition: 0,
+    yPosition: 0,
+    width: 576,
+    height,
+    borderWidth: 0,
+    borderColor: 5,
+    paddingLength: 4,
+    containerID: TRANSCRIPT_ID,
+    containerName: TRANSCRIPT_NAME,
+    content,
+    isEventCapture,
+  })
+}
+
+/**
  * Build the transcript-only page (caption mode).
  *
  * Used to return from the Plex view. Must be rebuildPageContainer, never
@@ -50,23 +81,11 @@ export async function showTranscriptPage(
   bridge: { rebuildPageContainer: (c: RebuildPageContainer) => Promise<boolean> },
   content: string,
 ): Promise<boolean> {
-  const transcript = new TextContainerProperty({
-    xPosition: 0,
-    yPosition: 0,
-    width: 576,
-    height: 288,
-    borderWidth: 0,
-    borderColor: 5,
-    paddingLength: 4,
-    containerID: TRANSCRIPT_ID,
-    containerName: TRANSCRIPT_NAME,
-    content,
-    // Capture returns here so tap-to-pause works again in caption mode.
-    isEventCapture: 1,
-  })
-
   return bridge.rebuildPageContainer(
-    new RebuildPageContainer({ containerTotalNum: 1, textObject: [transcript] }),
+    new RebuildPageContainer({
+      containerTotalNum: 1,
+      textObject: [transcriptContainer(content, 1)],
+    }),
   )
 }
 

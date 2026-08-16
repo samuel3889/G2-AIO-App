@@ -5,10 +5,12 @@ import {
   TextContainerUpgrade,
   OsEventTypeList,
 } from '@evenrealities/even_hub_sdk'
-import { startSttStream, type SessionState } from './asr/stt'
+import { startSttStream, type SessionState, type AssistantState } from './asr/stt'
 import { mountUi, setStatus, setTranscript } from './ui'
 import { mountSettings } from './settings'
-import { showPlexPage, showTranscriptPage } from './plex'
+import { showPlexPage, showTranscriptPage, transcriptContainer } from './plex'
+import { assistantBox, overlayBottom, OVERLAP } from './overlay'
+import { RebuildPageContainer } from '@evenrealities/even_hub_sdk'
 import { showMenuPage, MENU_ACTIONS, menuLabels, type MenuAction } from './menu'
 import { mountSessions, setLiveSession, refreshSessions } from './sessions'
 
@@ -63,13 +65,20 @@ let sessionUtterances = 0
 
 let micOn = false
 
+// The assistant exchange currently on the lens, or null. While this is set
+// the page carries extra containers, so a textContainerUpgrade aimed at the
+// transcript would be writing into a page whose layout has changed under it.
+let assistant: AssistantState | null = null
+
 function scheduleGlassesRender() {
   if (pageMode !== 'transcript') return
+  if (assistant !== null) return
   if (renderTimer !== null) return
   renderTimer = window.setTimeout(async () => {
     renderTimer = null
     // Re-check: a list may have taken over during the 120ms debounce.
     if (pageMode !== 'transcript') return
+    if (assistant !== null) return
     if (currentContent === lastRender) return
     lastRender = currentContent
     await bridge.textContainerUpgrade(
@@ -147,6 +156,18 @@ try {
         console.log(`[app] summary ready for ${id}`)
         void refreshSessions()
       },
+      onAssistant: (s: AssistantState | null) => {
+        assistant = s
+        if (s) {
+          // The overlay only makes sense over captions. If a list is up, the
+          // rebuild replaces it — the alternative is composing the box with
+          // every page type, for a case that essentially never happens.
+          pageMode = 'transcript'
+          void renderAssistant(s)
+        } else {
+          void showCaptions()
+        }
+      },
     },
   )
 } catch (err) {
@@ -165,6 +186,40 @@ if (stt) {
   await bridge.audioControl(true)
   micOn = true
   refreshStatus()
+}
+
+/**
+ * Rebuild the caption page WITH the assistant boxes drawn over it.
+ *
+ * There is no z-order and no foreground layer in the SDK, so an "overlay" is
+ * a page rebuild that carries the transcript plus the boxes. Called on every
+ * phase change, which is what makes the box grow as the exchange fills in.
+ */
+async function renderAssistant(s: AssistantState) {
+  const boxes = assistantBox(s)
+
+  // OVERLAP=false shrinks the transcript to the space under the boxes rather
+  // than letting them overlap. See the note in overlay.ts.
+  const base = transcriptContainer(
+    currentContent,
+    0, // capture belongs to the overlay while it is up
+    OVERLAP ? 288 : Math.max(20, 288 - overlayBottom(s)),
+  )
+
+  const ok = await bridge.rebuildPageContainer(
+    new RebuildPageContainer({
+      containerTotalNum: 1 + boxes.length,
+      textObject: [base, ...boxes],
+    }),
+  )
+  if (!ok) {
+    setStatus('error', 'rebuildPageContainer failed (assistant)')
+    console.error('Failed to build assistant overlay')
+    return
+  }
+  // The transcript container was just recreated, so the debounced renderer's
+  // idea of what is on the lens is stale.
+  lastRender = ''
 }
 
 /** Rebuild the caption page and hand the display back to the transcript. */
@@ -286,6 +341,11 @@ async function runMenuSelection(index: number | undefined, name: string | undefi
 
 /** Double tap. Back, per platform convention — never a shutdown. */
 async function goBack() {
+  // Back out of the assistant box first — it is the topmost thing on screen.
+  if (assistant !== null) {
+    stt?.dismiss()
+    return
+  }
   if (pageMode === 'transcript') {
     // Captions is the launch page, so "back" from here goes up to the menu.
     await showMenu()
@@ -370,6 +430,13 @@ const unsubscribe = bridge.onEvenHubEvent(event => {
     textType === OsEventTypeList.CLICK_EVENT ||
     listType === OsEventTypeList.CLICK_EVENT
   ) {
+    // While the assistant box is up it owns the taps: dismiss it and hand
+    // the lens back, rather than toggling the mic underneath it.
+    if (assistant !== null) {
+      stt?.dismiss()
+      return
+    }
+
     if (pageMode === 'menu') {
       void runMenuSelection(
         event.listEvent?.currentSelectItemIndex,

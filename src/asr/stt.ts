@@ -55,11 +55,29 @@ export interface SttResult {
   interimText: string
 }
 
+/**
+ * The assistant exchange, as structured data rather than one blob of text.
+ *
+ * main.ts needs the question and the answer SEPARATELY so it can render them
+ * as two boxes with different borders — collapsing them into a single string
+ * here would throw away the distinction the display depends on.
+ */
+export interface AssistantState {
+  phase: 'listening' | 'question' | 'thinking' | 'answer'
+  question: string
+  answer: string
+}
+
 export interface SttHooks {
   /** Recording started/stopped/counted. */
   onSession?: (s: SessionState) => void
   /** Summary finished, some seconds after stopSession(). */
   onSummary?: (id: string, text: string) => void
+  /**
+   * Assistant exchange changed, or null when it is dismissed and the lens
+   * goes back to captions.
+   */
+  onAssistant?: (s: AssistantState | null) => void
 }
 
 const GATEWAY_URL = import.meta.env.VITE_GATEWAY_URL as string
@@ -142,6 +160,18 @@ export function startSttStream(
   // next thing said in the room. Cleared on timeout, or by the next wake.
   let overlay: string | null = null
   let overlayTimer: number | null = null
+
+  // The question is carried across three separate frames — 'question',
+  // 'thinking', then 'answer' — so it has to be held here. The 'answer'
+  // frame does not repeat it.
+  let assistantQuestion = ''
+
+  function emitAssistant(
+    phase: AssistantState['phase'],
+    answer = '',
+  ) {
+    hooks.onAssistant?.({ phase, question: assistantQuestion, answer })
+  }
 
   function showOverlay(text: string, holdMs: number) {
     overlay = text
@@ -253,16 +283,34 @@ export function startSttStream(
         case 'wake':
           // Bare wake phrase: gateway is armed and waiting for a question.
           console.log('[stt] wake - listening for question')
-          showOverlay('Listening…', 10000)
+          assistantQuestion = ''
+          // `overlay` is still set here even though main.ts now draws the
+          // box: it is what stops caption frames repainting the lens
+          // underneath the overlay. Only the RENDERING moved out of this
+          // module, not the display ownership.
+          overlay = 'listening'
+          if (overlayTimer !== null) clearTimeout(overlayTimer)
+          overlayTimer = window.setTimeout(() => {
+            overlay = null
+            overlayTimer = null
+            hooks.onAssistant?.(null)
+            onResult({ finalText, interimText: '' })
+          }, 10000)
+          emitAssistant('listening')
           break
 
         case 'question':
           console.log(`[stt] question: ${msg.text}`)
-          showOverlay(`? ${msg.text}`, 30000)
+          assistantQuestion = msg.text ?? ''
+          overlay = 'question'
+          if (overlayTimer !== null) clearTimeout(overlayTimer)
+          overlayTimer = null // held until the answer resolves it
+          emitAssistant('question')
           break
 
         case 'thinking':
-          showOverlay('Thinking…', 30000)
+          overlay = 'thinking'
+          emitAssistant('thinking')
           break
 
         case 'answer':
@@ -275,9 +323,18 @@ export function startSttStream(
             overlay = msg.text
             if (overlayTimer !== null) clearTimeout(overlayTimer)
             overlayTimer = null // no auto-dismiss: the user scrolls it
+            hooks.onAssistant?.(null)
             onLines(msg.lines)
           } else {
-            showOverlay(msg.text, ANSWER_HOLD_MS)
+            overlay = 'answer'
+            emitAssistant('answer', msg.text ?? '')
+            if (overlayTimer !== null) clearTimeout(overlayTimer)
+            overlayTimer = window.setTimeout(() => {
+              overlay = null
+              overlayTimer = null
+              hooks.onAssistant?.(null)
+              onResult({ finalText, interimText: '' })
+            }, ANSWER_HOLD_MS)
           }
           break
 
@@ -349,6 +406,8 @@ export function startSttStream(
 
     dismiss() {
       clearOverlay()
+      assistantQuestion = ''
+      hooks.onAssistant?.(null)
       onResult({ finalText, interimText: '' })
     },
 
