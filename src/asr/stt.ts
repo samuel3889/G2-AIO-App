@@ -6,7 +6,8 @@
  * changes to main.ts are required.
  *
  * Wire format out: raw 16 kHz mono s16le PCM binary frames.
- * Wire format in:  JSON - {type:"ready"|"speech"|"final"|"error", ...}
+ * Wire format in:  JSON - {type:"ready"|"speech"|"final"|"wake"|
+ *                          "question"|"thinking"|"answer"|"error", ...}
  *
  * Env (in .env.local):
  *   VITE_GATEWAY_URL=wss://g2gateway.sams-server.duckdns.org:50443/ws/stt
@@ -28,6 +29,10 @@ const GATEWAY_URL = import.meta.env.VITE_GATEWAY_URL as string
 // Cap retained transcript so a long session cannot grow without bound.
 // main.ts slices the last 240 chars for the lens; this is the backing store.
 const MAX_CHARS = 4000
+
+// How long an answer stays on the lens before captions resume. Long enough
+// to read two short sentences without feeling stuck.
+const ANSWER_HOLD_MS = 12000
 
 /**
  * The SDK's audioPcm type is not documented. Normalise whatever it hands us
@@ -78,6 +83,30 @@ export function startSttStream(
   let retry = 0
   let finalText = ''
 
+  // Assistant mode. While this is non-null it OWNS the display: captions
+  // stop updating the lens so an answer cannot be shoved off screen by the
+  // next thing said in the room. Cleared on timeout, or by the next wake.
+  let overlay: string | null = null
+  let overlayTimer: number | null = null
+
+  function showOverlay(text: string, holdMs: number) {
+    overlay = text
+    if (overlayTimer !== null) clearTimeout(overlayTimer)
+    overlayTimer = window.setTimeout(() => {
+      overlay = null
+      overlayTimer = null
+      // Fall back to the live transcript.
+      onResult({ finalText, interimText: '' })
+    }, holdMs)
+    onResult({ finalText: text, interimText: '' })
+  }
+
+  function clearOverlay() {
+    if (overlayTimer !== null) clearTimeout(overlayTimer)
+    overlayTimer = null
+    overlay = null
+  }
+
   // Small bounded queue: frames that arrive while reconnecting. Dropping is
   // correct here - stale audio is worse than missing audio, and an unbounded
   // buffer would dump minutes of backlog into Whisper on reconnect.
@@ -116,8 +145,10 @@ export function startSttStream(
         case 'speech':
           // Live "someone is talking" signal. Shown as interim so the lens
           // reacts immediately instead of sitting still until Whisper
-          // returns ~1s later.
-          onResult({ finalText, interimText: msg.active ? ' ...' : '' })
+          // returns ~1s later. Suppressed while an answer is displayed.
+          if (overlay === null) {
+            onResult({ finalText, interimText: msg.active ? ' ...' : '' })
+          }
           break
 
         case 'final': {
@@ -126,9 +157,29 @@ export function startSttStream(
             finalText = finalText.slice(-MAX_CHARS)
           }
           console.log(`[stt] +${msg.stt_ms}ms: ${msg.text}`)
-          onResult({ finalText, interimText: '' })
+          if (overlay === null) onResult({ finalText, interimText: '' })
           break
         }
+
+        case 'wake':
+          // Bare wake phrase: gateway is armed and waiting for a question.
+          console.log('[stt] wake - listening for question')
+          showOverlay('Listening…', 10000)
+          break
+
+        case 'question':
+          console.log(`[stt] question: ${msg.text}`)
+          showOverlay(`? ${msg.text}`, 30000)
+          break
+
+        case 'thinking':
+          showOverlay('Thinking…', 30000)
+          break
+
+        case 'answer':
+          console.log(`[stt] answer (+${msg.llm_ms}ms): ${msg.text}`)
+          showOverlay(msg.text, ANSWER_HOLD_MS)
+          break
 
         case 'error':
           onError(new Error(msg.message))
@@ -172,6 +223,7 @@ export function startSttStream(
 
     close() {
       closed = true
+      clearOverlay()
       pending.length = 0
       try {
         ws?.close()
