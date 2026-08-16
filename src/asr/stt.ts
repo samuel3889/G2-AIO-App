@@ -174,7 +174,6 @@ export function startSttStream(
           break
         }
 
-<<<<<<< HEAD
         case 'wake':
           // Bare wake phrase: gateway is armed and waiting for a question.
           console.log('[stt] wake - listening for question')
@@ -206,28 +205,6 @@ export function startSttStream(
           }
           break
 
-=======
-        case 'wake':
-          // Bare wake phrase: gateway is armed and waiting for a question.
-          console.log('[stt] wake - listening for question')
-          showOverlay('Listening…', 10000)
-          break
-
-        case 'question':
-          console.log(`[stt] question: ${msg.text}`)
-          showOverlay(`? ${msg.text}`, 30000)
-          break
-
-        case 'thinking':
-          showOverlay('Thinking…', 30000)
-          break
-
-        case 'answer':
-          console.log(`[stt] answer (+${msg.llm_ms}ms): ${msg.text}`)
-          showOverlay(msg.text, ANSWER_HOLD_MS)
-          break
-
->>>>>>> 08aec9d652698fe98abd780516d156fb6f5861ec
         case 'error':
           onError(new Error(msg.message))
           break
