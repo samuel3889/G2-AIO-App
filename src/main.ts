@@ -161,6 +161,14 @@ try {
         void refreshSessions()
       },
       onAssistant: (s: AssistantState | null) => {
+        // `dismiss()` in stt.ts fires this hook unconditionally, and
+        // showCaptions() below calls dismiss() — so handling a null when
+        // there is already no assistant re-enters showCaptions forever.
+        // That loop repaints the caption page continuously, which is what
+        // wipes the menu and the Plex list a few ms after they render.
+        // A null when nothing is up means there is nothing to hand back.
+        if (s === null && assistant === null) return
+
         assistant = s
         if (s) {
           // The overlay only makes sense over captions. If a list is up, the
@@ -236,6 +244,9 @@ async function renderAssistant(s: AssistantState) {
 
 /** Rebuild the caption page and hand the display back to the transcript. */
 async function showCaptions() {
+  // Diagnostic: if this repeats without a gesture, a page-rebuild loop is
+  // running and it is what is wiping the menu and the Plex list.
+  console.log(`[page] captions (from ${pageMode})`)
   const ok = await showTranscriptPage(bridge, currentContent)
   if (!ok) {
     setStatus('error', 'rebuildPageContainer failed (transcript)')
@@ -417,6 +428,9 @@ const unsubscribe = bridge.onEvenHubEvent(event => {
     textType === OsEventTypeList.DOUBLE_CLICK_EVENT ||
     listType === OsEventTypeList.DOUBLE_CLICK_EVENT
   ) {
+    // Diagnostic: if two of these land per physical double tap, the second
+    // one takes "back" out of the page the first one just built.
+    console.log(`[gesture] double-tap in ${pageMode}`)
     void goBack()
     return
   }
