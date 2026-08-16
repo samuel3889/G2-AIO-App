@@ -104,6 +104,8 @@ export async function showMenuPage(
     paddingLength: 4,
     containerID: MENU_HEADER_ID,
     containerName: MENU_HEADER_NAME,
+    // All-or-nothing per page, and unique across every container array.
+    zOrderIndex: 0,
     content: menuHeader(state),
     // Only ONE container per page may capture events, and it must be the
     // list - otherwise scroll never reaches it.
@@ -119,6 +121,7 @@ export async function showMenuPage(
     paddingLength: 4,
     containerID: MENU_LIST_ID,
     containerName: MENU_LIST_NAME,
+    zOrderIndex: 1,
     itemContainer: new ListItemContainerProperty({
       itemCount: items.length,
       // 0 = auto fill length, per the SDK docs.

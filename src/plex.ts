@@ -54,6 +54,7 @@ export function transcriptContainer(
   content: string,
   isEventCapture = 1,
   height = 288,
+  zOrderIndex = 0,
 ): TextContainerProperty {
   return new TextContainerProperty({
     xPosition: 0,
@@ -67,6 +68,9 @@ export function transcriptContainer(
     containerName: TRANSCRIPT_NAME,
     content,
     isEventCapture,
+    // Backmost on any page it appears on. Callers that stack things over it
+    // pass their own depth via overlay.ts's zFor().
+    zOrderIndex,
   })
 }
 
@@ -119,6 +123,10 @@ export async function showPlexPage(
     paddingLength: 4,
     containerID: PLEX_HEADER_ID,
     containerName: 'plex-header',
+    // zOrderIndex is ALL-OR-NOTHING per page: because the list below sets
+    // one, this must too, or the whole rebuild is rejected client-side with
+    // MISSING_Z_ORDER_INDEX and never reaches the glasses.
+    zOrderIndex: 0,
     content: header,
     // Only ONE container per page may capture events, and it must be the
     // list - otherwise scroll never reaches it.
@@ -134,6 +142,9 @@ export async function showPlexPage(
     paddingLength: 4,
     containerID: PLEX_LIST_ID,
     containerName: PLEX_LIST_NAME,
+    // Must differ from the header's: values are unique across listObject,
+    // textObject and imageObject combined, not per-array.
+    zOrderIndex: 1,
     itemContainer: new ListItemContainerProperty({
       // UNVERIFIED: the docs say itemCount is 1-20 but do not say whether
       // it means total items or how many are VISIBLE at once. Set to the

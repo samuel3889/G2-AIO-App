@@ -45,12 +45,54 @@ const SCREEN_H = 288
  * Draw the box ON TOP of the transcript (true), or shrink the transcript and
  * sit below it (false).
  *
- * Overlapping containers are not documented as supported. If the lens shows
- * the transcript bleeding through the box, or the box not drawing at all,
- * set this to false: the layout stops being an overlay and becomes a split,
- * which is guaranteed-defined.
+ * SDK 0.0.11+ added zOrderIndex, so overlapping is now a supported, defined
+ * operation rather than the gamble it was on 0.0.10. Kept as a switch only
+ * as a fallback if stacking misbehaves on your firmware.
  */
 export const OVERLAP = true
+
+// --- z-order ----------------------------------------------------------------
+
+/**
+ * Does a HIGHER zOrderIndex draw in FRONT?
+ *
+ * The SDK documents zOrderIndex as controlling stacking order and validates
+ * it, but nowhere states the direction — I checked both index.d.ts and the
+ * compiled index.js. This is the one thing that has to be found empirically.
+ *
+ * Test: trigger an assistant box. If it draws OVER the transcript, this is
+ * right. If the transcript covers it, flip to false. Nothing else changes.
+ */
+export const HIGHER_IS_FRONT = true
+
+/**
+ * Resolve a depth to a zOrderIndex.
+ *
+ * `depth` is 0 for the backmost container, increasing toward the front.
+ * `total` is how many containers the page has. Reversing preserves
+ * uniqueness, which the SDK requires — see assignZOrder below.
+ */
+export function zFor(depth: number, total: number): number {
+  return HIGHER_IS_FRONT ? depth : total - 1 - depth
+}
+
+/**
+ * Z-ORDER RULES, read out of the shipped validator (index.js), not the docs.
+ * validateEvenHubPageContainerZOrder runs CLIENT-SIDE before the bridge call:
+ *
+ *  1. ALL-OR-NOTHING. If any container on the page sets zOrderIndex, every
+ *     container must — across listObject, textObject AND imageObject
+ *     together. Otherwise: MISSING_Z_ORDER_INDEX.
+ *  2. UNIQUE. No two containers may share a value, again across all three
+ *     arrays. Otherwise: DUPLICATE_Z_ORDER_INDEX.
+ *  3. FINITE NUMBER. Otherwise: INVALID_Z_ORDER_INDEX.
+ *  4. Omitting it everywhere stays valid — that is the 0.0.10 behaviour.
+ *
+ * Failure does NOT reach the glasses. createStartUpPageContainer returns 1
+ * (invalid) and rebuildPageContainer returns false, with `[EvenHub:CODE]
+ * message` logged to console. So a half-applied zOrderIndex looks exactly
+ * like a rebuild failure — check the console before suspecting the display.
+ */
 
 // --- geometry ---------------------------------------------------------------
 
@@ -167,6 +209,10 @@ export function assistantBox(s: AssistantState): TextContainerProperty[] {
       paddingLength: BOX_PADDING,
       containerID: OVERLAY_Q_ID,
       containerName: OVERLAY_Q_NAME,
+      // Depth 1 of 3: transcript(0) < question(1) < answer(2). `total` must
+      // match what renderAssistant actually puts on the page, or the values
+      // collide when HIGHER_IS_FRONT is false.
+      zOrderIndex: zFor(1, 3),
       content: qText,
       // Capture goes to the LAST box added, so it is set below once we know
       // whether an answer box exists.
@@ -199,6 +245,7 @@ export function assistantBox(s: AssistantState): TextContainerProperty[] {
         paddingLength: BOX_PADDING,
         containerID: OVERLAY_A_ID,
         containerName: OVERLAY_A_NAME,
+        zOrderIndex: zFor(2, 3),
         content: shown,
         // Exactly one container on the page captures events, and while the
         // overlay is up it must be the overlay - so a tap dismisses the box
@@ -208,6 +255,10 @@ export function assistantBox(s: AssistantState): TextContainerProperty[] {
     )
   } else {
     out[0].isEventCapture = 1
+    // No answer box: the page is transcript(0) + question(1), two containers.
+    // Recompute, because zFor(1, 3) and zFor(1, 2) differ when
+    // HIGHER_IS_FRONT is false and the transcript would then collide.
+    out[0].zOrderIndex = zFor(1, 2)
   }
 
   return out

@@ -9,7 +9,7 @@ import { startSttStream, type SessionState, type AssistantState } from './asr/st
 import { mountUi, setStatus, setTranscript } from './ui'
 import { mountSettings } from './settings'
 import { showPlexPage, showTranscriptPage, transcriptContainer } from './plex'
-import { assistantBox, overlayBottom, OVERLAP } from './overlay'
+import { assistantBox, overlayBottom, OVERLAP, zFor } from './overlay'
 import { RebuildPageContainer } from '@evenrealities/even_hub_sdk'
 import { showMenuPage, MENU_ACTIONS, menuLabels, type MenuAction } from './menu'
 import { mountSessions, setLiveSession, refreshSessions } from './sessions'
@@ -37,6 +37,10 @@ const transcript = new TextContainerProperty({
   containerName: 'transcript',
   content: 'Listening…',
   isEventCapture: 1,
+  // Only container on the startup page, so any finite value works — but it
+  // must be present if any sibling ever has one. Single container here, so
+  // 0 is both valid and unambiguous.
+  zOrderIndex: 0,
 })
 
 const created = await bridge.createStartUpPageContainer(
@@ -200,20 +204,28 @@ async function renderAssistant(s: AssistantState) {
 
   // OVERLAP=false shrinks the transcript to the space under the boxes rather
   // than letting them overlap. See the note in overlay.ts.
+  // Depth 0 = backmost. `total` must match the container count below, since
+  // zFor() derives values from it and they have to stay unique.
+  const total = 1 + boxes.length
   const base = transcriptContainer(
     currentContent,
     0, // capture belongs to the overlay while it is up
     OVERLAP ? 288 : Math.max(20, 288 - overlayBottom(s)),
+    zFor(0, total),
   )
 
   const ok = await bridge.rebuildPageContainer(
     new RebuildPageContainer({
-      containerTotalNum: 1 + boxes.length,
+      containerTotalNum: total,
       textObject: [base, ...boxes],
     }),
   )
   if (!ok) {
-    setStatus('error', 'rebuildPageContainer failed (assistant)')
+    // A z-order violation fails HERE, client-side, without ever reaching the
+    // glasses — the SDK logs `[EvenHub:MISSING_Z_ORDER_INDEX]` or similar to
+    // the console and returns false. Check the console before assuming this
+    // is a display problem.
+    setStatus('error', 'rebuildPageContainer failed (assistant) — check console for [EvenHub:...]')
     console.error('Failed to build assistant overlay')
     return
   }
