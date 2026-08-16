@@ -5,10 +5,12 @@ import {
   TextContainerUpgrade,
   OsEventTypeList,
 } from '@evenrealities/even_hub_sdk'
-import { startSttStream } from './asr/stt'
+import { startSttStream, type SessionState } from './asr/stt'
 import { mountUi, setStatus, setTranscript } from './ui'
 import { mountSettings } from './settings'
 import { showPlexPage, showTranscriptPage } from './plex'
+import { showMenuPage, MENU_ACTIONS, menuLabels, type MenuAction } from './menu'
+import { mountSessions, setLiveSession, refreshSessions } from './sessions'
 
 mountSettings()
 mountUi()
@@ -47,18 +49,26 @@ let lastRender = ''
 let renderTimer: number | null = null
 let currentContent = 'Listening…'
 
-// Which page is on the lens. In 'plex' mode the transcript container does
-// not exist, so textContainerUpgrade would target a container that is not
-// on the page - every caption render must be suppressed until we rebuild.
-type PageMode = 'transcript' | 'plex'
+// Which page is on the lens. In 'plex' and 'menu' modes the transcript
+// container does not exist, so textContainerUpgrade would target a
+// container that is not on the page — every caption render must be
+// suppressed until we rebuild.
+type PageMode = 'transcript' | 'plex' | 'menu'
 let pageMode: PageMode = 'transcript'
+
+// Conversate state, mirrored from the gateway. The gateway is authoritative;
+// this is only what the lens and phone display.
+let sessionActive = false
+let sessionUtterances = 0
+
+let micOn = false
 
 function scheduleGlassesRender() {
   if (pageMode !== 'transcript') return
   if (renderTimer !== null) return
   renderTimer = window.setTimeout(async () => {
     renderTimer = null
-    // Re-check: the list may have taken over during the 120ms debounce.
+    // Re-check: a list may have taken over during the 120ms debounce.
     if (pageMode !== 'transcript') return
     if (currentContent === lastRender) return
     lastRender = currentContent
@@ -70,6 +80,20 @@ function scheduleGlassesRender() {
       }),
     )
   }, 120) // debounce display writes — BLE render queue is slow
+}
+
+// Phone status line. One place, because it now has to account for three
+// page modes and a recording flag.
+function hint(): string {
+  if (pageMode === 'menu') return 'Menu · scroll · tap to select · double-tap to go back'
+  if (pageMode === 'plex') return 'Plex · scroll to browse · double-tap to go back'
+  const rec = sessionActive ? `Recording (${sessionUtterances}) · ` : ''
+  const mic = micOn ? 'Microphone live' : 'Paused'
+  return `${rec}${mic} · tap to ${micOn ? 'pause' : 'resume'} · double-tap for menu`
+}
+
+function refreshStatus() {
+  setStatus(sessionActive || micOn ? 'listening' : 'paused', hint())
 }
 
 // The default stt.ts is a blank stub that throws. Catch the throw so the UI
@@ -100,7 +124,29 @@ try {
         return
       }
       pageMode = 'plex'
-      setStatus(micOn ? 'listening' : 'paused', 'Plex · scroll to browse · tap to close')
+      refreshStatus()
+    },
+    {
+      onSession: (s: SessionState) => {
+        sessionActive = s.active
+        sessionUtterances = s.utterances
+        setLiveSession(s)
+
+        // A stop with no summary coming (LLM unconfigured, or nothing
+        // recorded) never produces a 'summary' frame, so the session list
+        // has to be refreshed here or the new entry never appears.
+        if (!s.active) void refreshSessions()
+
+        // The menu header shows the utterance count, but the page is NOT
+        // rebuilt on every increment: rebuilding resets the OS list
+        // selection, which would yank the highlight out from under a user
+        // mid-scroll. The count refreshes when the menu is next opened.
+        refreshStatus()
+      },
+      onSummary: (id, _text) => {
+        console.log(`[app] summary ready for ${id}`)
+        void refreshSessions()
+      },
     },
   )
 } catch (err) {
@@ -108,25 +154,21 @@ try {
   console.error('STT startup failed:', err)
 }
 
-let micOn = false
+// Phone-side session browser. Mounted after `stt` exists so its Start/Stop
+// buttons can reach the socket.
+mountSessions({
+  start: (title?: string) => stt?.startSession(title),
+  stop: () => stt?.stopSession(),
+})
+
 if (stt) {
   await bridge.audioControl(true)
   micOn = true
-  setStatus('listening', 'Microphone live · tap to pause · double-tap to exit')
+  refreshStatus()
 }
 
-// Tap toggles capture. `audioControl(false)` stops the host pushing PCM, so no
-// further frames reach `sendPcm`; the STT client itself is left open. If your
-// provider closes an idle stream, tear it down here and reopen it on resume.
-// No-ops until stt.ts is wired up — there is no capture to pause.
-/**
- * Leave the Plex list and rebuild the caption page.
- *
- * Only one container per page may capture events, and in list mode that is
- * the list - so tap cannot mean "pause mic" while Plex is up. Tap closes
- * the list instead; mic control returns with the transcript page.
- */
-async function exitPlex() {
+/** Rebuild the caption page and hand the display back to the transcript. */
+async function showCaptions() {
   const ok = await showTranscriptPage(bridge, currentContent)
   if (!ok) {
     setStatus('error', 'rebuildPageContainer failed (transcript)')
@@ -138,10 +180,23 @@ async function exitPlex() {
   // whatever lastRender holds no longer reflects what is on the lens.
   lastRender = ''
   stt?.dismiss()
-  setStatus(
-    micOn ? 'listening' : 'paused',
-    micOn ? 'Microphone live · tap to pause · double-tap to exit' : 'Paused · tap to resume · double-tap to exit',
-  )
+  refreshStatus()
+}
+
+/** Rebuild the menu page. Reads current state for its labels and header. */
+async function showMenu() {
+  const ok = await showMenuPage(bridge, {
+    sessionActive,
+    micOn,
+    utterances: sessionUtterances,
+  })
+  if (!ok) {
+    setStatus('error', 'rebuildPageContainer failed (menu)')
+    console.error('Failed to build menu page')
+    return
+  }
+  pageMode = 'menu'
+  refreshStatus()
 }
 
 function toggleMic() {
@@ -150,16 +205,81 @@ function toggleMic() {
   bridge.audioControl(micOn)
   currentContent = micOn ? 'Listening…' : 'Paused'
   scheduleGlassesRender()
-  setStatus(
-    micOn ? 'listening' : 'paused',
-    micOn ? 'Microphone live · tap to pause · double-tap to exit' : 'Paused · tap to resume · double-tap to exit',
-  )
+  refreshStatus()
+}
+
+function toggleSession() {
+  if (!stt) return
+  // The gateway confirms with a 'session' frame; nothing here assumes the
+  // command succeeded.
+  if (sessionActive) stt.stopSession()
+  else stt.startSession()
+}
+
+/**
+ * Map a menu tap to an action.
+ *
+ * currentSelectItemIndex is a protobuf int32, so index 0 arrives as
+ * `undefined` for exactly the same reason CLICK_EVENT does — `?? 0` is
+ * load-bearing, not defensive padding. The item NAME is cross-checked
+ * against the labels we built, because a name is a non-zero-value field
+ * and therefore survives the wire intact.
+ */
+async function runMenuSelection(index: number | undefined, name: string | undefined) {
+  const labels = menuLabels({ sessionActive, micOn, utterances: sessionUtterances })
+  let i = index ?? 0
+  if (name) {
+    const byName = labels.indexOf(name)
+    if (byName >= 0) i = byName
+  }
+
+  const action: MenuAction | undefined = MENU_ACTIONS[i]
+  console.log(`[menu] select index=${index} name=${name} -> ${action}`)
+
+  switch (action) {
+    case 'captions':
+      await showCaptions()
+      break
+    case 'session':
+      toggleSession()
+      // Leave the menu so the user sees captions and the recording flag
+      // rather than a stale menu header.
+      await showCaptions()
+      break
+    case 'mic':
+      toggleMic()
+      // Rebuild so the label flips to its opposite.
+      await showMenu()
+      break
+    case 'exit':
+      // The only place in this app that shuts the container down. Long
+      // press is the normal route and never reaches us; this is the
+      // fallback if that gesture is unavailable. exitMode 1 shows the OS
+      // confirmation layer, and SYSTEM_EXIT_EVENT arrives on confirm.
+      await bridge.shutDownPageContainer(1)
+      break
+    default:
+      await showCaptions()
+  }
+}
+
+/** Double tap. Back, per platform convention — never a shutdown. */
+async function goBack() {
+  if (pageMode === 'transcript') {
+    // Captions is the launch page, so "back" from here goes up to the menu.
+    await showMenu()
+  } else {
+    await showCaptions()
+  }
 }
 
 let cleanedUp = false
 function cleanup() {
   if (cleanedUp) return
   cleanedUp = true
+  // Stop the recording deliberately so the gateway writes the file and
+  // summarises, rather than treating it as an interrupted session.
+  if (sessionActive) stt?.stopSession()
   bridge.audioControl(false)
   stt?.close()
   unsubscribe()
@@ -171,29 +291,32 @@ function cleanup() {
 // single tap arrives as an envelope whose `eventType` is `undefined`. The
 // default has to be resolved INSIDE the envelope check. Writing
 // `event.sysEvent?.eventType ?? OsEventTypeList.CLICK_EVENT` instead would
-// read CLICK on events that carry no `sysEvent` at all — and in this template
+// read CLICK on events that carry no `sysEvent` at all — and in this app
 // that means every incoming audio frame would fire the tap handler.
 function eventTypeOf(envelope?: { eventType?: OsEventTypeList }): OsEventTypeList | null {
   if (!envelope) return null
   return envelope.eventType ?? OsEventTypeList.CLICK_EVENT
 }
 
-// Event routing, critical details:
-//   • Taps/double-taps/lifecycle come through `event.sysEvent`.
-//     Audio PCM frames come through `event.audioEvent` — separate branch.
-//   • Double-tap → `shutDownPageContainer(1)` is a root-level check: it
-//     must fire no matter which envelope the event arrives in, so users
-//     can always exit the app. System exit confirmation dialog appears;
-//     SYSTEM_EXIT_EVENT fires on confirm and we clean up there.
-//   • Check DOUBLE_CLICK_EVENT before CLICK_EVENT.
+// Event routing.
+//
+// Gestures, per platform convention:
+//   single tap -> select
+//   double tap -> back
+//   long press -> shut down, consumed by the OS. There is NO long-press
+//                 value in OsEventTypeList, so it never arrives here; we
+//                 only see the aftermath as SYSTEM_EXIT_EVENT.
+//
+// Check DOUBLE_CLICK_EVENT before CLICK_EVENT: a double tap may also
+// deliver a click envelope, and back must win over select.
 const unsubscribe = bridge.onEvenHubEvent(event => {
   const pcm = event.audioEvent?.audioPcm
   if (pcm) stt?.sendPcm(pcm)
 
   const sysType = eventTypeOf(event.sysEvent)
   const textType = eventTypeOf(event.textEvent)
-  // In Plex mode the LIST holds isEventCapture, so taps and scrolls arrive
-  // as listEvent rather than textEvent.
+  // In list modes (plex, menu) the LIST holds isEventCapture, so taps and
+  // scrolls arrive as listEvent rather than textEvent.
   const listType = eventTypeOf(event.listEvent)
 
   if (
@@ -201,7 +324,7 @@ const unsubscribe = bridge.onEvenHubEvent(event => {
     textType === OsEventTypeList.DOUBLE_CLICK_EVENT ||
     listType === OsEventTypeList.DOUBLE_CLICK_EVENT
   ) {
-    bridge.shutDownPageContainer(1)
+    void goBack()
     return
   }
 
@@ -214,7 +337,7 @@ const unsubscribe = bridge.onEvenHubEvent(event => {
     listType === OsEventTypeList.SCROLL_BOTTOM_EVENT
   ) {
     console.log(
-      `[plex] scroll ${listType === OsEventTypeList.SCROLL_TOP_EVENT ? 'up' : 'down'} ->`,
+      `[${pageMode}] scroll ${listType === OsEventTypeList.SCROLL_TOP_EVENT ? 'up' : 'down'} ->`,
       event.listEvent?.currentSelectItemIndex,
       event.listEvent?.currentSelectItemName,
     )
@@ -226,9 +349,24 @@ const unsubscribe = bridge.onEvenHubEvent(event => {
     textType === OsEventTypeList.CLICK_EVENT ||
     listType === OsEventTypeList.CLICK_EVENT
   ) {
-    // Tap means "close the list" in Plex mode, "pause mic" in caption mode.
-    if (pageMode === 'plex') void exitPlex()
-    else toggleMic()
+    if (pageMode === 'menu') {
+      void runMenuSelection(
+        event.listEvent?.currentSelectItemIndex,
+        event.listEvent?.currentSelectItemName,
+      )
+    } else if (pageMode === 'plex') {
+      // Nothing to select in a read-only list. Logged so the index is
+      // visible; double tap is how you leave.
+      console.log(
+        '[plex] select ->',
+        event.listEvent?.currentSelectItemIndex,
+        event.listEvent?.currentSelectItemName,
+      )
+    } else {
+      // Caption mode: tap is the primary action, and the primary action
+      // here is pausing capture.
+      toggleMic()
+    }
     return
   }
 

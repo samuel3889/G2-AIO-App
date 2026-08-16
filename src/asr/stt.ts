@@ -2,17 +2,27 @@
  * Gateway STT client - drop-in replacement for the ASR template's stub.
  *
  * Streams glasses mic PCM to your Unraid gateway over a WebSocket and
- * returns transcripts. Keeps the exact signature main.ts expects, so no
- * changes to main.ts are required.
+ * returns transcripts.
  *
- * Wire format out: raw 16 kHz mono s16le PCM binary frames.
+ * Wire format out: raw 16 kHz mono s16le PCM binary frames, plus JSON
+ *                  control frames {cmd:"flush"|"reset"|"endconvo"|
+ *                  "session_start"|"session_stop"|"session_status"}.
  * Wire format in:  JSON - {type:"ready"|"speech"|"final"|"wake"|
- *                          "question"|"thinking"|"answer"|"error", ...}
+ *                          "question"|"thinking"|"answer"|"convo"|
+ *                          "session"|"summary"|"error", ...}
  *
  * Env (in .env.local):
  *   VITE_GATEWAY_URL=wss://g2gateway.sams-server.duckdns.org:50443/ws/stt
  *   VITE_STT_API_KEY=<the AUTH_TOKEN from your compose .env>
  */
+
+export interface SessionState {
+  active: boolean
+  id: string | null
+  utterances: number
+  /** Only present on the frame sent when a session stops. */
+  summarizing?: boolean
+}
 
 export interface SttHandle {
   sendPcm(pcm: unknown): void
@@ -24,6 +34,12 @@ export interface SttHandle {
    * so main.ts calls this when they tap to leave.
    */
   dismiss(): void
+  /** Begin recording a conversation. Idempotent on the gateway side. */
+  startSession(title?: string): void
+  /** Stop recording; the gateway saves and then summarises in background. */
+  stopSession(): void
+  /** Ask the gateway to restate session state (used after a reconnect). */
+  sessionStatus(): void
 }
 
 export interface SttResult {
@@ -31,15 +47,29 @@ export interface SttResult {
   interimText: string
 }
 
+export interface SttHooks {
+  /** Recording started/stopped/counted. */
+  onSession?: (s: SessionState) => void
+  /** Summary finished, some seconds after stopSession(). */
+  onSummary?: (id: string, text: string) => void
+}
+
 const GATEWAY_URL = import.meta.env.VITE_GATEWAY_URL as string
 
 // Cap retained transcript so a long session cannot grow without bound.
 // main.ts slices the last 240 chars for the lens; this is the backing store.
+// NOTE: this is the LENS buffer only. The authoritative transcript of a
+// recorded session lives on the gateway, uncapped, so trimming here does
+// not lose anything from the saved file.
 const MAX_CHARS = 4000
 
 // How long an answer stays on the lens before captions resume. Long enough
 // to read two short sentences without feeling stuck.
 const ANSWER_HOLD_MS = 12000
+
+// A summary is long and arrives without warning. Give it longer than an
+// answer, and let a tap dismiss it early.
+const SUMMARY_HOLD_MS = 30000
 
 /**
  * The SDK's audioPcm type is not documented. Normalise whatever it hands us
@@ -86,6 +116,9 @@ export function startSttStream(
   // in main.ts would throw away the structure the gateway already computed.
   // Omit it and behaviour is exactly as before.
   onLines?: (lines: string[]) => void,
+  // Optional 5th arg: conversate session callbacks. Grouped into one object
+  // rather than added as a 6th and 7th positional parameter.
+  hooks: SttHooks = {},
 ): SttHandle {
   if (!GATEWAY_URL) {
     throw new Error('VITE_GATEWAY_URL not set - copy .env.example to .env.local')
@@ -128,6 +161,17 @@ export function startSttStream(
 
   const url = `${GATEWAY_URL}${GATEWAY_URL.includes('?') ? '&' : '?'}token=${encodeURIComponent(token)}`
 
+  // Control frames are NOT queued. A stale "stop recording" replayed after a
+  // reconnect would stop a session the user had since restarted, and the
+  // gateway ends the recording on disconnect anyway - so dropping is right.
+  function sendCmd(cmd: string, extra: Record<string, unknown> = {}) {
+    if (ws?.readyState !== WebSocket.OPEN) {
+      console.warn(`[stt] cmd ${cmd} dropped - socket not open`)
+      return
+    }
+    ws.send(JSON.stringify({ cmd, ...extra }))
+  }
+
   function connect() {
     if (closed) return
 
@@ -140,6 +184,10 @@ export function startSttStream(
       while (pending.length && ws?.readyState === WebSocket.OPEN) {
         ws.send(pending.shift()!)
       }
+      // Resync the UI. A reconnect gets a FRESH gateway session object, so
+      // this will report inactive after a drop - which is the truth, and
+      // better than a phone UI still claiming to be recording.
+      sendCmd('session_status')
     }
 
     ws.onmessage = ev => {
@@ -205,6 +253,32 @@ export function startSttStream(
           }
           break
 
+        case 'session':
+          console.log(
+            `[stt] session ${msg.active ? 'recording' : 'stopped'} `
+            + `${msg.id ?? '-'} (${msg.utterances} utterances)`,
+          )
+          hooks.onSession?.({
+            active: !!msg.active,
+            id: msg.id ?? null,
+            utterances: msg.utterances ?? 0,
+            summarizing: msg.summarizing,
+          })
+          break
+
+        case 'summary':
+          console.log(`[stt] summary ${msg.id}: ${msg.text}`)
+          hooks.onSummary?.(msg.id, msg.text)
+          // The summary owns the lens the same way an answer does, so the
+          // next thing said in the room cannot scroll it away mid-read.
+          showOverlay(msg.text, SUMMARY_HOLD_MS)
+          break
+
+        case 'convo':
+          // Follow-up window opened or closed. Logged only.
+          console.log(`[stt] convo active=${msg.active}`)
+          break
+
         case 'error':
           onError(new Error(msg.message))
           break
@@ -248,6 +322,18 @@ export function startSttStream(
     dismiss() {
       clearOverlay()
       onResult({ finalText, interimText: '' })
+    },
+
+    startSession(title?: string) {
+      sendCmd('session_start', title ? { title } : {})
+    },
+
+    stopSession() {
+      sendCmd('session_stop')
+    },
+
+    sessionStatus() {
+      sendCmd('session_status')
     },
 
     close() {
