@@ -212,8 +212,29 @@ function toggleSession() {
   if (!stt) return
   // The gateway confirms with a 'session' frame; nothing here assumes the
   // command succeeded.
-  if (sessionActive) stt.stopSession()
-  else stt.startSession()
+  if (sessionActive) {
+    stt.stopSession()
+    return
+  }
+
+  // Starting a recording with the mic paused records silence. audioControl(false)
+  // stops the HOST pushing PCM, so no frames reach sendPcm, the gateway never
+  // sees an utterance, and the lens sits on whatever text was last rendered —
+  // which looks exactly like a frozen display. Starting a conversation implies
+  // capturing it, so resume the mic rather than leaving a recording that cannot
+  // record.
+  if (!micOn) {
+    micOn = true
+    bridge.audioControl(true)
+  }
+
+  // Fresh conversation, fresh lens. Without this, showCaptions() below calls
+  // stt.dismiss(), which repaints the caption buffer — and that buffer still
+  // holds the tail of whatever was said before the recording started.
+  stt.clearTranscript()
+  currentContent = 'Listening…'
+
+  stt.startSession()
 }
 
 /**

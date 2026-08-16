@@ -40,6 +40,14 @@ export interface SttHandle {
   stopSession(): void
   /** Ask the gateway to restate session state (used after a reconnect). */
   sessionStatus(): void
+  /**
+   * Empty the lens caption buffer.
+   *
+   * Called when a new recording starts: the lens should show the new
+   * conversation, not the tail of whatever was said before it. The gateway
+   * keeps the authoritative transcript, so nothing is lost by clearing here.
+   */
+  clearTranscript(): void
 }
 
 export interface SttResult {
@@ -334,6 +342,12 @@ export function startSttStream(
 
     sessionStatus() {
       sendCmd('session_status')
+    },
+
+    clearTranscript() {
+      finalText = ''
+      clearOverlay()
+      onResult({ finalText: '', interimText: '' })
     },
 
     close() {
