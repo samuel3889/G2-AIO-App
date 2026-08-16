@@ -8,6 +8,7 @@ import {
 import { startSttStream } from './asr/stt'
 import { mountUi, setStatus, setTranscript } from './ui'
 import { mountSettings } from './settings'
+import { showPlexPage, showTranscriptPage } from './plex'
 
 mountSettings()
 mountUi()
@@ -46,10 +47,19 @@ let lastRender = ''
 let renderTimer: number | null = null
 let currentContent = 'Listening…'
 
+// Which page is on the lens. In 'plex' mode the transcript container does
+// not exist, so textContainerUpgrade would target a container that is not
+// on the page - every caption render must be suppressed until we rebuild.
+type PageMode = 'transcript' | 'plex'
+let pageMode: PageMode = 'transcript'
+
 function scheduleGlassesRender() {
+  if (pageMode !== 'transcript') return
   if (renderTimer !== null) return
   renderTimer = window.setTimeout(async () => {
     renderTimer = null
+    // Re-check: the list may have taken over during the 120ms debounce.
+    if (pageMode !== 'transcript') return
     if (currentContent === lastRender) return
     lastRender = currentContent
     await bridge.textContainerUpgrade(
@@ -79,6 +89,19 @@ try {
       setStatus('error', `STT error: ${(err as Error)?.message ?? err}`)
       console.error('STT error:', err)
     },
+    // Structured answer (Plex activity): render as a scrollable OS list.
+    async lines => {
+      const ok = await showPlexPage(bridge, lines)
+      if (!ok) {
+        // rebuildPageContainer returns boolean, NOT the numeric result code
+        // createStartUpPageContainer gives - `!ok`, not `!== 0`.
+        setStatus('error', 'rebuildPageContainer failed (plex)')
+        console.error('Failed to build plex page')
+        return
+      }
+      pageMode = 'plex'
+      setStatus(micOn ? 'listening' : 'paused', 'Plex · scroll to browse · tap to close')
+    },
   )
 } catch (err) {
   setStatus('error', (err as Error)?.message ?? 'STT startup failed')
@@ -96,6 +119,31 @@ if (stt) {
 // further frames reach `sendPcm`; the STT client itself is left open. If your
 // provider closes an idle stream, tear it down here and reopen it on resume.
 // No-ops until stt.ts is wired up — there is no capture to pause.
+/**
+ * Leave the Plex list and rebuild the caption page.
+ *
+ * Only one container per page may capture events, and in list mode that is
+ * the list - so tap cannot mean "pause mic" while Plex is up. Tap closes
+ * the list instead; mic control returns with the transcript page.
+ */
+async function exitPlex() {
+  const ok = await showTranscriptPage(bridge, currentContent)
+  if (!ok) {
+    setStatus('error', 'rebuildPageContainer failed (transcript)')
+    console.error('Failed to rebuild transcript page')
+    return
+  }
+  pageMode = 'transcript'
+  // Force the next render through: the container was just recreated, so
+  // whatever lastRender holds no longer reflects what is on the lens.
+  lastRender = ''
+  stt?.dismiss()
+  setStatus(
+    micOn ? 'listening' : 'paused',
+    micOn ? 'Microphone live · tap to pause · double-tap to exit' : 'Paused · tap to resume · double-tap to exit',
+  )
+}
+
 function toggleMic() {
   if (!stt) return
   micOn = !micOn
@@ -144,14 +192,43 @@ const unsubscribe = bridge.onEvenHubEvent(event => {
 
   const sysType = eventTypeOf(event.sysEvent)
   const textType = eventTypeOf(event.textEvent)
+  // In Plex mode the LIST holds isEventCapture, so taps and scrolls arrive
+  // as listEvent rather than textEvent.
+  const listType = eventTypeOf(event.listEvent)
 
-  if (sysType === OsEventTypeList.DOUBLE_CLICK_EVENT || textType === OsEventTypeList.DOUBLE_CLICK_EVENT) {
+  if (
+    sysType === OsEventTypeList.DOUBLE_CLICK_EVENT ||
+    textType === OsEventTypeList.DOUBLE_CLICK_EVENT ||
+    listType === OsEventTypeList.DOUBLE_CLICK_EVENT
+  ) {
     bridge.shutDownPageContainer(1)
     return
   }
 
-  if (sysType === OsEventTypeList.CLICK_EVENT || textType === OsEventTypeList.CLICK_EVENT) {
-    toggleMic()
+  // Scrolling is handled by the OS - the list moves itself and reports
+  // afterwards. Logged only, so the selected index is visible while
+  // tuning itemCount. Deliberately does NOT rebuild the page: doing so
+  // would fight the OS for control of the selection.
+  if (
+    listType === OsEventTypeList.SCROLL_TOP_EVENT ||
+    listType === OsEventTypeList.SCROLL_BOTTOM_EVENT
+  ) {
+    console.log(
+      `[plex] scroll ${listType === OsEventTypeList.SCROLL_TOP_EVENT ? 'up' : 'down'} ->`,
+      event.listEvent?.currentSelectItemIndex,
+      event.listEvent?.currentSelectItemName,
+    )
+    return
+  }
+
+  if (
+    sysType === OsEventTypeList.CLICK_EVENT ||
+    textType === OsEventTypeList.CLICK_EVENT ||
+    listType === OsEventTypeList.CLICK_EVENT
+  ) {
+    // Tap means "close the list" in Plex mode, "pause mic" in caption mode.
+    if (pageMode === 'plex') void exitPlex()
+    else toggleMic()
     return
   }
 

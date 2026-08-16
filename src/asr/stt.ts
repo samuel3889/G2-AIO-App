@@ -17,6 +17,13 @@
 export interface SttHandle {
   sendPcm(pcm: unknown): void
   close(): void
+  /**
+   * Drop any answer currently owning the lens and resume captions.
+   *
+   * The Plex list has no auto-dismiss timer - the user may be reading it -
+   * so main.ts calls this when they tap to leave.
+   */
+  dismiss(): void
 }
 
 export interface SttResult {
@@ -73,6 +80,12 @@ export function startSttStream(
   token: string,
   onResult: (r: SttResult) => void,
   onError: (e: unknown) => void,
+  // Optional 4th arg, added for the Plex list view. When the gateway sends
+  // an answer carrying a `lines` array, it goes here INSTEAD of onResult -
+  // a list needs the array, and joining it into one string then re-splitting
+  // in main.ts would throw away the structure the gateway already computed.
+  // Omit it and behaviour is exactly as before.
+  onLines?: (lines: string[]) => void,
 ): SttHandle {
   if (!GATEWAY_URL) {
     throw new Error('VITE_GATEWAY_URL not set - copy .env.example to .env.local')
@@ -161,6 +174,39 @@ export function startSttStream(
           break
         }
 
+<<<<<<< HEAD
+        case 'wake':
+          // Bare wake phrase: gateway is armed and waiting for a question.
+          console.log('[stt] wake - listening for question')
+          showOverlay('Listening…', 10000)
+          break
+
+        case 'question':
+          console.log(`[stt] question: ${msg.text}`)
+          showOverlay(`? ${msg.text}`, 30000)
+          break
+
+        case 'thinking':
+          showOverlay('Thinking…', 30000)
+          break
+
+        case 'answer':
+          console.log(`[stt] answer (+${msg.llm_ms}ms): ${msg.text}`)
+          // Structured answers (currently only Plex) render as a scrollable
+          // list rather than a text overlay. Still set `overlay` so captions
+          // stop writing to the lens underneath the list - clearing it is
+          // what hands the display back.
+          if (Array.isArray(msg.lines) && msg.lines.length && onLines) {
+            overlay = msg.text
+            if (overlayTimer !== null) clearTimeout(overlayTimer)
+            overlayTimer = null // no auto-dismiss: the user scrolls it
+            onLines(msg.lines)
+          } else {
+            showOverlay(msg.text, ANSWER_HOLD_MS)
+          }
+          break
+
+=======
         case 'wake':
           // Bare wake phrase: gateway is armed and waiting for a question.
           console.log('[stt] wake - listening for question')
@@ -181,6 +227,7 @@ export function startSttStream(
           showOverlay(msg.text, ANSWER_HOLD_MS)
           break
 
+>>>>>>> 08aec9d652698fe98abd780516d156fb6f5861ec
         case 'error':
           onError(new Error(msg.message))
           break
@@ -219,6 +266,11 @@ export function startSttStream(
       } else if (pending.length < MAX_PENDING) {
         pending.push(bytes)
       }
+    },
+
+    dismiss() {
+      clearOverlay()
+      onResult({ finalText, interimText: '' })
     },
 
     close() {
