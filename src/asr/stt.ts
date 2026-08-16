@@ -7,7 +7,7 @@
  * Wire format out: raw 16 kHz mono s16le PCM binary frames, plus JSON
  *                  control frames {cmd:"flush"|"reset"|"endconvo"|
  *                  "session_start"|"session_stop"|"session_status"}.
- * Wire format in:  JSON - {type:"ready"|"speech"|"final"|"wake"|
+ * Wire format in:  JSON - {type:"ready"|"speech"|"partial"|"final"|"wake"|
  *                          "question"|"thinking"|"answer"|"convo"|
  *                          "session"|"summary"|"error", ...}
  *
@@ -215,8 +215,28 @@ export function startSttStream(
           // Live "someone is talking" signal. Shown as interim so the lens
           // reacts immediately instead of sitting still until Whisper
           // returns ~1s later. Suppressed while an answer is displayed.
+          //
+          // Only the START of speech writes here. Clearing on speech END
+          // would blank a partial that is already on screen, leaving the
+          // lens empty for the ~500ms until the 'final' arrives — a visible
+          // flicker on every single utterance. The 'final' case clears the
+          // interim, which is the correct moment for it.
+          if (overlay === null && msg.active) {
+            onResult({ finalText, interimText: ' ...' })
+          }
+          break
+
+        case 'partial':
+          // In-progress utterance, re-decoded from the start each time. The
+          // text can CHANGE between partials as Whisper gets more context,
+          // so this REPLACES the interim rather than appending to it —
+          // appending would produce "I scream I scream ice cream".
+          //
+          // Rendered as interim, so `finalText` stays untouched: when the
+          // 'final' for this utterance lands it appends once, and the
+          // interim is cleared. Nothing is ever double-counted.
           if (overlay === null) {
-            onResult({ finalText, interimText: msg.active ? ' ...' : '' })
+            onResult({ finalText, interimText: ` ${msg.text}` })
           }
           break
 
