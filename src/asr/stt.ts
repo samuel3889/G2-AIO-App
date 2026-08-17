@@ -95,11 +95,11 @@ const MAX_CHARS = 4000
 // window the user can see is the window they can talk into. When it lapses
 // the box goes and the interaction is over.
 //
-// The gateway's own CONVO_ARM_S must be set to match (its default is 45s).
-// It is not timer-driven server-side, so it would otherwise stay armed after
-// the box is gone and answer a follow-up with nothing on the lens to show
-// it — which is why the timeout below sends 'endconvo' rather than just
-// clearing the display.
+// The gateway's own CONVO_ARM_S must be set to match. It is not timer-driven
+// server-side, so the ONLY thing that closes the follow-up window early is
+// the 'endconvo' this client sends - see closeAssistant(). If CONVO_ARM_S is
+// longer than this and an 'endconvo' is ever missed, the gateway stays armed
+// with an invisible box and routes room chatter to the LLM.
 const ANSWER_HOLD_MS = 10000
 
 // How long a bare wake phrase stays armed waiting for the question to arrive
@@ -112,11 +112,23 @@ const LISTEN_HOLD_MS = 10000
 const SUMMARY_HOLD_MS = 30000
 
 /**
+ * Bytes we are willing to hand to WebSocket.send().
+ *
+ * TypeScript 5.7 made the typed arrays generic over their backing buffer, so
+ * a bare `Uint8Array` now means `Uint8Array<ArrayBufferLike>` - which INCLUDES
+ * SharedArrayBuffer. `WebSocket.send` accepts only `ArrayBufferView<ArrayBuffer>`,
+ * so an unqualified Uint8Array no longer satisfies it and every `ws.send(bytes)`
+ * fails to compile. Naming the narrow type once here is what makes both send
+ * sites check, rather than casting at each of them.
+ */
+type PcmBytes = Uint8Array<ArrayBuffer>
+
+/**
  * The SDK's audioPcm type is not documented. Normalise whatever it hands us
  * into bytes, and log which branch hit so the shape is known for certain.
  */
 let loggedShape = false
-function toBytes(pcm: unknown): Uint8Array | null {
+function toBytes(pcm: unknown): PcmBytes | null {
   if (pcm == null) return null
 
   if (!loggedShape) {
@@ -125,11 +137,24 @@ function toBytes(pcm: unknown): Uint8Array | null {
     console.log(`[stt] audioPcm shape: ${ctor}`, pcm)
   }
 
-  if (pcm instanceof Uint8Array) return pcm
+  if (pcm instanceof Uint8Array) {
+    // Already bytes, but possibly over a SharedArrayBuffer as far as the
+    // type system is concerned. The runtime check is what narrows it; the
+    // else branch copies, which is the only correct way out of a shared
+    // buffer and in practice never runs - the SDK does not use SAB.
+    return pcm.buffer instanceof ArrayBuffer
+      ? (pcm as PcmBytes)
+      : new Uint8Array(pcm)
+  }
   if (pcm instanceof ArrayBuffer) return new Uint8Array(pcm)
   if (ArrayBuffer.isView(pcm)) {
     const v = pcm as ArrayBufferView
-    return new Uint8Array(v.buffer, v.byteOffset, v.byteLength)
+    // Same narrowing as above. A VIEW is taken rather than a copy on the
+    // common path: this runs once per 20ms audio frame.
+    const view = new Uint8Array(v.buffer, v.byteOffset, v.byteLength)
+    return v.buffer instanceof ArrayBuffer
+      ? (view as PcmBytes)
+      : new Uint8Array(view)
   }
   if (Array.isArray(pcm)) return new Uint8Array(pcm as number[])
   if (typeof pcm === 'string') {
@@ -205,10 +230,40 @@ export function startSttStream(
     overlay = null
   }
 
+  /**
+   * The box is closing. Tear down BOTH sides of the exchange.
+   *
+   * The gateway's follow-up window is not timer-driven: `armed_at` is only
+   * consulted when the next utterance completes, and nothing on the server
+   * expires it on a schedule. So the ONLY thing that ends a conversation
+   * early is this 'endconvo' frame, which makes app.py's handle_cmd call
+   * end_convo() - clearing `history` and zeroing `armed_at`.
+   *
+   * Every path that takes the box off the lens must come through here.
+   * Previously the ANSWER_HOLD_MS timeout was the only one that did, so a
+   * tap-to-dismiss left the gateway armed with the conversation still held:
+   * invisible box, live microphone, next sentence in the room answered by
+   * the LLM.
+   *
+   * The `overlay !== null` guard matters. main.ts calls dismiss() from
+   * showCaptions() on EVERY rebuild of the caption page, including simply
+   * backing out of the menu. Without the guard that would fire an endconvo
+   * each time and could disarm a wake the user had just spoken.
+   */
+  function closeAssistant(reason: string) {
+    if (overlay === null) return
+    console.log(`[stt] assistant closed (${reason}) - ending conversation`)
+    sendCmd('endconvo')
+    clearOverlay()
+    assistantQuestion = ''
+    hooks.onAssistant?.(null)
+    onResult({ finalText, interimText: '' })
+  }
+
   // Small bounded queue: frames that arrive while reconnecting. Dropping is
   // correct here - stale audio is worse than missing audio, and an unbounded
   // buffer would dump minutes of backlog into Whisper on reconnect.
-  const pending: Uint8Array[] = []
+  const pending: PcmBytes[] = []
   const MAX_PENDING = 50 // ~1s at 20ms frames
 
   const url = `${GATEWAY_URL}${GATEWAY_URL.includes('?') ? '&' : '?'}token=${encodeURIComponent(token)}`
@@ -305,10 +360,13 @@ export function startSttStream(
           overlay = 'listening'
           if (overlayTimer !== null) clearTimeout(overlayTimer)
           overlayTimer = window.setTimeout(() => {
-            overlay = null
+            // Send 'endconvo' here too, not just a display clear. WAKE_ARM_S
+            // (8s) is shorter than this hold, so the gateway would usually
+            // have lapsed on its own - but "usually" is not "always", and a
+            // wake that armed the gateway and then timed out on the lens
+            // must not leave a live microphone behind it.
             overlayTimer = null
-            hooks.onAssistant?.(null)
-            onResult({ finalText, interimText: '' })
+            closeAssistant('listen timeout')
           }, LISTEN_HOLD_MS)
           emitAssistant('listening')
           break
@@ -344,16 +402,11 @@ export function startSttStream(
             emitAssistant('answer', msg.text ?? '')
             if (overlayTimer !== null) clearTimeout(overlayTimer)
             overlayTimer = window.setTimeout(() => {
-              // Close the follow-up window on the GATEWAY too, not just on
-              // the lens. app.py handles 'endconvo' by dropping the history
-              // and disarming; without it the gateway stays armed for the
-              // rest of CONVO_ARM_S and would route the next thing said in
-              // the room to the LLM with no box on screen.
-              sendCmd('endconvo')
-              overlay = null
+              // Null the handle first: closeAssistant() calls clearOverlay(),
+              // which would otherwise clearTimeout on the timer that is
+              // currently executing. Harmless, but it reads as a bug.
               overlayTimer = null
-              hooks.onAssistant?.(null)
-              onResult({ finalText, interimText: '' })
+              closeAssistant('answer timeout')
             }, ANSWER_HOLD_MS)
           }
           break
@@ -403,6 +456,15 @@ export function startSttStream(
         return
       }
 
+      // A dropped socket ends the conversation whether we like it or not:
+      // the gateway holds `history` and `armed_at` in the WebSocket handler's
+      // locals, so a reconnect gets a fresh, disarmed session. Clear the box
+      // to match, WITHOUT sending endconvo - there is no socket to send it
+      // on, and the server-side state it would clear is already gone.
+      clearOverlay()
+      assistantQuestion = ''
+      hooks.onAssistant?.(null)
+
       retry += 1
       const delay = Math.min(500 * 2 ** (retry - 1), 5000)
       console.warn(`[stt] disconnected (${e.code}), retry in ${delay}ms`)
@@ -425,10 +487,10 @@ export function startSttStream(
     },
 
     dismiss() {
-      clearOverlay()
-      assistantQuestion = ''
-      hooks.onAssistant?.(null)
-      onResult({ finalText, interimText: '' })
+      // Tap, double-tap, or main.ts rebuilding the caption page. This is the
+      // path that used to leave the gateway armed - it cleared the lens and
+      // told the server nothing.
+      closeAssistant('dismissed')
     },
 
     startSession(title?: string) {
@@ -445,6 +507,9 @@ export function startSttStream(
 
     clearTranscript() {
       finalText = ''
+      // A new recording is starting. If an exchange is still up, it is over -
+      // and the gateway needs to hear that, not just the lens.
+      closeAssistant('transcript cleared')
       clearOverlay()
       onResult({ finalText: '', interimText: '' })
     },
