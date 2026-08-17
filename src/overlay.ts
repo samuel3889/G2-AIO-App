@@ -1,8 +1,15 @@
 /**
  * Assistant overlay box.
  *
- * Shows your question and Jarvis's reply in a bordered box drawn over the
- * current page, without leaving that page.
+ * ONE box. It is drawn around the question as soon as there is one, and it
+ * GROWS downward as "Thinking…" and then the answer are appended to the same
+ * container. Previously this returned two stacked containers; a single one
+ * is what makes it read as one growing box rather than a box that spawns a
+ * second box underneath it.
+ *
+ * The page this box goes on carries NOTHING ELSE — main.ts no longer puts
+ * the transcript underneath it, so whatever was on the lens disappears for
+ * the duration of the exchange.
  *
  * WHAT THE SDK DOES NOT GIVE US, and how this works around it:
  *
@@ -11,18 +18,15 @@
  *    borderRadius, paddingLength, containerID, containerName,
  *    isEventCapture, content (index.d.ts:356-377). borderColor (0-16) is
  *    the only colour knob in the entire API.
- *    => "Question dimmer than the answer" is done with a DIM BORDER on the
- *       question box and a bright border on the answer box. The text itself
- *       renders identically; that is not tunable.
+ *    => There is now one border for the whole exchange. The old dim-border
+ *       trick made the QUESTION read as secondary; with one container there
+ *       is one border, so that distinction is gone. It cost a second box.
  *
  * 2. No z-order and no foreground layer. The only "foreground layer" in the
  *    SDK is shutDownPageContainer(1)'s exit dialog, which is the OS's own
- *    and cannot hold our content. An overlay is therefore a page REBUILD
- *    carrying the base containers plus these boxes.
- *    => Whether overlapping containers stack predictably is undocumented.
- *       OVERLAP below switches between drawing over the transcript and
- *       splitting the screen with it. If the lens renders the overlap badly,
- *       flip it to false.
+ *    and cannot hold our content. An overlay is therefore a page REBUILD.
+ *    => With nothing behind it, OVERLAP no longer decides anything. It is
+ *       kept exported so nothing that imports it breaks.
  *
  * 3. No font metrics. Height has to be estimated from a character count.
  *    CHARS_PER_LINE and LINE_HEIGHT are GUESSES and need calibrating against
@@ -30,24 +34,24 @@
  */
 import { TextContainerProperty } from '@evenrealities/even_hub_sdk'
 
-// Container IDs. 1 transcript, 2/3 plex, 4/5 menu, 6/7 overlay.
+// Container IDs. 1 transcript, 2/3 plex, 4/5 menu, 6 overlay.
 export const OVERLAY_Q_ID = 6
+// No longer used: the answer shares the question's container. Kept reserved
+// so nothing else claims 7 and collides if a second box ever comes back.
 export const OVERLAY_A_ID = 7
 
 // containerName is capped at 16 characters.
-const OVERLAY_Q_NAME = 'assist-q'
-const OVERLAY_A_NAME = 'assist-a'
+const OVERLAY_NAME = 'assist'
 
 const SCREEN_W = 576
 const SCREEN_H = 288
 
 /**
- * Draw the box ON TOP of the transcript (true), or shrink the transcript and
- * sit below it (false).
+ * Historically: draw the box ON TOP of the transcript (true), or shrink the
+ * transcript and sit below it (false).
  *
- * SDK 0.0.11+ added zOrderIndex, so overlapping is now a supported, defined
- * operation rather than the gamble it was on 0.0.10. Kept as a switch only
- * as a fallback if stacking misbehaves on your firmware.
+ * The overlay page no longer carries the transcript at all, so this decides
+ * nothing now. Kept as an export only so existing imports still compile.
  */
 export const OVERLAP = true
 
@@ -60,8 +64,9 @@ export const OVERLAP = true
  * it, but nowhere states the direction — I checked both index.d.ts and the
  * compiled index.js. This is the one thing that has to be found empirically.
  *
- * Test: trigger an assistant box. If it draws OVER the transcript, this is
- * right. If the transcript covers it, flip to false. Nothing else changes.
+ * With a single container on the overlay page there is nothing to stack, so
+ * this no longer affects the overlay. It still matters to any page that
+ * carries more than one container.
  */
 export const HIGHER_IS_FRONT = true
 
@@ -115,9 +120,8 @@ export const CHARS_PER_LINE = 30
  */
 export const LINE_HEIGHT = 28
 
-/** Border colour 0-16. The only way to make the question read as secondary. */
-const Q_BORDER_COLOR = 2
-const A_BORDER_COLOR = 12
+/** Border colour 0-16. One border now, for the whole exchange. */
+const BOX_BORDER_COLOR = 12
 
 // Never let a very long answer push the box off screen.
 const MAX_BOX_BOTTOM = SCREEN_H - BOX_TOP
@@ -168,13 +172,13 @@ function boxHeight(text: string): number {
   return countLines(text) * LINE_HEIGHT + BOX_PADDING * 2
 }
 
-/** What the question box shows for each phase. */
+/** The question line for each phase. */
 function questionText(s: AssistantState): string {
   if (s.phase === 'listening') return 'Listening…'
   return s.question ? `“${s.question}”` : 'Listening…'
 }
 
-/** What the answer box shows, or '' when there is nothing to show yet. */
+/** The reply line, or '' when there is nothing to show yet. */
 function answerText(s: AssistantState): string {
   if (s.phase === 'thinking') return 'Thinking…'
   if (s.phase === 'answer') return s.answer
@@ -182,91 +186,60 @@ function answerText(s: AssistantState): string {
 }
 
 /**
- * Build the overlay containers for the current assistant state.
+ * Build the overlay container for the current assistant state.
  *
- * Returns one box while waiting, two once there is an answer. The boxes are
- * sized to their content and stacked, so the pair grows downward as the
- * exchange fills in: question -> question + "Thinking…" -> question + answer.
+ * Returns an ARRAY of exactly one box. The array shape is kept because
+ * main.ts spreads it into textObject and derives containerTotalNum from its
+ * length — returning a bare container would mean changing both, for no gain.
+ *
+ * The box is sized to its content, so it grows in place across the phases:
+ * question -> question + "Thinking…" -> question + answer.
  */
 export function assistantBox(s: AssistantState): TextContainerProperty[] {
   const qText = questionText(s)
   const aText = answerText(s)
 
-  const qH = boxHeight(qText)
-  const out: TextContainerProperty[] = []
+  // A blank line between the two so the reply is visually separate from the
+  // question without a second border to separate it.
+  const body = aText ? `${qText}\n\n${aText}` : qText
 
-  out.push(
+  // Clamp: trim until the box fits above the bottom margin.
+  const avail = MAX_BOX_BOTTOM - BOX_TOP
+  const maxLines = Math.max(1, Math.floor((avail - BOX_PADDING * 2) / LINE_HEIGHT))
+  let shown = body
+  if (countLines(shown) > maxLines) {
+    // Cut by characters rather than lines: countLines is an estimate, and
+    // slicing to a hard character budget cannot overshoot the way a
+    // line-based cut can.
+    shown = `${body.slice(0, maxLines * CHARS_PER_LINE - 1).trimEnd()}…`
+  }
+
+  return [
     new TextContainerProperty({
       xPosition: BOX_MARGIN_X,
       yPosition: BOX_TOP,
       width: BOX_W,
-      height: qH,
-      borderWidth: 1,
-      // Dim border: this is the only "dimmer" the SDK allows. The text
-      // inside renders exactly like the answer's.
-      borderColor: Q_BORDER_COLOR,
+      height: Math.min(boxHeight(shown), avail),
+      borderWidth: 2,
+      borderColor: BOX_BORDER_COLOR,
       borderRadius: 4,
       paddingLength: BOX_PADDING,
       containerID: OVERLAY_Q_ID,
-      containerName: OVERLAY_Q_NAME,
-      // Depth 1 of 3: transcript(0) < question(1) < answer(2). `total` must
-      // match what renderAssistant actually puts on the page, or the values
-      // collide when HIGHER_IS_FRONT is false.
-      zOrderIndex: zFor(1, 3),
-      content: qText,
-      // Capture goes to the LAST box added, so it is set below once we know
-      // whether an answer box exists.
-      isEventCapture: 0,
+      containerName: OVERLAY_NAME,
+      // Only container on the overlay page, so depth 0 of 1.
+      zOrderIndex: zFor(0, 1),
+      // Exactly one container per page captures events, and while the
+      // overlay is up it must be this one - so a tap dismisses the box.
+      isEventCapture: 1,
     }),
-  )
-
-  if (aText) {
-    const top = BOX_TOP + qH + 4
-    // Clamp: trim the answer until its box fits above the bottom margin.
-    const avail = MAX_BOX_BOTTOM - top
-    const maxLines = Math.max(1, Math.floor((avail - BOX_PADDING * 2) / LINE_HEIGHT))
-    let shown = aText
-    if (countLines(shown) > maxLines) {
-      // Cut by characters rather than lines: countLines is an estimate, and
-      // slicing to a hard character budget cannot overshoot the way a
-      // line-based cut can.
-      shown = `${aText.slice(0, maxLines * CHARS_PER_LINE - 1).trimEnd()}…`
-    }
-
-    out.push(
-      new TextContainerProperty({
-        xPosition: BOX_MARGIN_X,
-        yPosition: top,
-        width: BOX_W,
-        height: Math.min(boxHeight(shown), avail),
-        borderWidth: 2,
-        borderColor: A_BORDER_COLOR,
-        borderRadius: 4,
-        paddingLength: BOX_PADDING,
-        containerID: OVERLAY_A_ID,
-        containerName: OVERLAY_A_NAME,
-        zOrderIndex: zFor(2, 3),
-        content: shown,
-        // Exactly one container on the page captures events, and while the
-        // overlay is up it must be the overlay - so a tap dismisses the box
-        // rather than doing whatever the page underneath does.
-        isEventCapture: 1,
-      }),
-    )
-  } else {
-    out[0].isEventCapture = 1
-    // No answer box: the page is transcript(0) + question(1), two containers.
-    // Recompute, because zFor(1, 3) and zFor(1, 2) differ when
-    // HIGHER_IS_FRONT is false and the transcript would then collide.
-    out[0].zOrderIndex = zFor(1, 2)
-  }
-
-  return out
+  ]
 }
 
 /**
- * Bottom edge of the overlay, for laying out the page underneath when
- * OVERLAP is false.
+ * Bottom edge of the overlay.
+ *
+ * main.ts no longer needs this (nothing is laid out underneath the box any
+ * more), but it is kept exported so existing imports still compile.
  */
 export function overlayBottom(s: AssistantState): number {
   const boxes = assistantBox(s)

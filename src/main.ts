@@ -8,8 +8,8 @@ import {
 import { startSttStream, type SessionState, type AssistantState } from './asr/stt'
 import { mountUi, setStatus, setTranscript } from './ui'
 import { mountSettings } from './settings'
-import { showPlexPage, showTranscriptPage, transcriptContainer } from './plex'
-import { assistantBox, overlayBottom, OVERLAP, zFor } from './overlay'
+import { showPlexPage, showTranscriptPage } from './plex'
+import { assistantBox } from './overlay'
 import { RebuildPageContainer } from '@evenrealities/even_hub_sdk'
 import { showMenuPage, MENU_ACTIONS, menuLabels, type MenuAction } from './menu'
 import { mountSessions, setLiveSession, refreshSessions } from './sessions'
@@ -70,8 +70,9 @@ let sessionUtterances = 0
 let micOn = false
 
 // The assistant exchange currently on the lens, or null. While this is set
-// the page carries extra containers, so a textContainerUpgrade aimed at the
-// transcript would be writing into a page whose layout has changed under it.
+// the transcript container is NOT ON THE PAGE AT ALL, so a
+// textContainerUpgrade aimed at it would be writing into a container that
+// does not exist.
 let assistant: AssistantState | null = null
 
 function scheduleGlassesRender() {
@@ -165,15 +166,14 @@ try {
         // showCaptions() below calls dismiss() — so handling a null when
         // there is already no assistant re-enters showCaptions forever.
         // That loop repaints the caption page continuously, which is what
-        // wipes the menu and the Plex list a few ms after they render.
+        // wiped the menu and the Plex list a few ms after they rendered.
         // A null when nothing is up means there is nothing to hand back.
         if (s === null && assistant === null) return
 
         assistant = s
         if (s) {
-          // The overlay only makes sense over captions. If a list is up, the
-          // rebuild replaces it — the alternative is composing the box with
-          // every page type, for a case that essentially never happens.
+          // The overlay REPLACES whatever page was up, including a list.
+          // pageMode records where captions resume from when it clears.
           pageMode = 'transcript'
           void renderAssistant(s)
         } else {
@@ -201,31 +201,23 @@ if (stt) {
 }
 
 /**
- * Rebuild the caption page WITH the assistant boxes drawn over it.
+ * Rebuild the page as JUST the assistant box.
  *
- * There is no z-order and no foreground layer in the SDK, so an "overlay" is
- * a page rebuild that carries the transcript plus the boxes. Called on every
- * phase change, which is what makes the box grow as the exchange fills in.
+ * The transcript container is deliberately NOT on this page: whatever was on
+ * the lens goes away for the duration of the exchange and comes back when
+ * showCaptions() rebuilds. One container, so there is nothing to stack and
+ * no z-order collision to get wrong.
+ *
+ * Called on every phase change, which is what makes the single box grow as
+ * the exchange fills in.
  */
 async function renderAssistant(s: AssistantState) {
   const boxes = assistantBox(s)
 
-  // OVERLAP=false shrinks the transcript to the space under the boxes rather
-  // than letting them overlap. See the note in overlay.ts.
-  // Depth 0 = backmost. `total` must match the container count below, since
-  // zFor() derives values from it and they have to stay unique.
-  const total = 1 + boxes.length
-  const base = transcriptContainer(
-    currentContent,
-    0, // capture belongs to the overlay while it is up
-    OVERLAP ? 288 : Math.max(20, 288 - overlayBottom(s)),
-    zFor(0, total),
-  )
-
   const ok = await bridge.rebuildPageContainer(
     new RebuildPageContainer({
-      containerTotalNum: total,
-      textObject: [base, ...boxes],
+      containerTotalNum: boxes.length,
+      textObject: boxes,
     }),
   )
   if (!ok) {
@@ -237,8 +229,8 @@ async function renderAssistant(s: AssistantState) {
     console.error('Failed to build assistant overlay')
     return
   }
-  // The transcript container was just recreated, so the debounced renderer's
-  // idea of what is on the lens is stale.
+  // The transcript container is not on the page at all now, so the debounced
+  // renderer's idea of what is on the lens is stale.
   lastRender = ''
 }
 
