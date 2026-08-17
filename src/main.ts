@@ -243,8 +243,12 @@ async function renderAssistant(s: AssistantState) {
   // done explicitly.
   await bridge.textContainerUpgrade(
     new TextContainerUpgrade({
-      containerID: OVERLAY_Q_ID,
-      containerName: OVERLAY_NAME,
+      // Read off the container that was just built, rather than from the
+      // constants: the probes in overlay.ts can change the ID or name, and
+      // an upgrade aimed at a container that is not on the page does
+      // nothing at all — silently.
+      containerID: boxes[0]?.containerID ?? OVERLAY_Q_ID,
+      containerName: boxes[0]?.containerName ?? OVERLAY_NAME,
       content: body,
     }),
   )

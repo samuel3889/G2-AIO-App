@@ -139,6 +139,30 @@ export const LINE_HEIGHT = 28
  */
 const DEBUG_BOX_TEXT: string | null = 'TEST'
 
+/**
+ * TEMPORARY DEBUG PROBE 2.
+ *
+ * When true, the box is drawn with the SAME geometry the transcript
+ * container uses — origin 0,0, full 576 width, no border, no radius,
+ * padding 4 — and only its height follows the content. The only thing that
+ * still differs from the caption page is the container ID and name.
+ *
+ * The pattern this is testing: every container in this app that renders
+ * text (transcript, Plex header, menu header) sits at x=0, y=0 and spans
+ * the full width. The assistant box is the only one that does not, and it
+ * is the only one whose text never appears — while its BORDER draws in the
+ * right place. That is what a text run positioned at the page origin and
+ * then clipped to the container rectangle would look like.
+ *
+ *   TEST appears -> position/border is the culprit; add one property back
+ *                   at a time (x offset, then y offset, then border) until
+ *                   it disappears again.
+ *   still blank  -> geometry is not it either, and the next variable is the
+ *                   container ID: reuse 1/'transcript' and see if the same
+ *                   box renders under the identity the OS already knows.
+ */
+const DEBUG_PLAIN_GEOMETRY = true
+
 /** Border colour 0-16. One border now, for the whole exchange. */
 const BOX_BORDER_COLOR = 12
 
@@ -235,14 +259,14 @@ export function assistantBox(s: AssistantState): TextContainerProperty[] {
 
   return [
     new TextContainerProperty({
-      xPosition: BOX_MARGIN_X,
-      yPosition: BOX_TOP,
-      width: BOX_W,
+      xPosition: DEBUG_PLAIN_GEOMETRY ? 0 : BOX_MARGIN_X,
+      yPosition: DEBUG_PLAIN_GEOMETRY ? 0 : BOX_TOP,
+      width: DEBUG_PLAIN_GEOMETRY ? SCREEN_W : BOX_W,
       height: Math.min(boxHeight(shown), avail),
-      borderWidth: 2,
-      borderColor: BOX_BORDER_COLOR,
-      borderRadius: 4,
-      paddingLength: BOX_PADDING,
+      borderWidth: DEBUG_PLAIN_GEOMETRY ? 0 : 2,
+      borderColor: DEBUG_PLAIN_GEOMETRY ? 5 : BOX_BORDER_COLOR,
+      borderRadius: DEBUG_PLAIN_GEOMETRY ? 0 : 4,
+      paddingLength: DEBUG_PLAIN_GEOMETRY ? 4 : BOX_PADDING,
       containerID: OVERLAY_Q_ID,
       containerName: OVERLAY_NAME,
       // Only container on the overlay page, so depth 0 of 1.
