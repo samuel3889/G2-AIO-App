@@ -294,12 +294,11 @@ export function assistantBox(s: AssistantState): TextContainerProperty[] {
       yPosition: DEBUG_PLAIN_GEOMETRY ? 0 : BOX_TOP,
       width: DEBUG_PLAIN_GEOMETRY ? SCREEN_W : BOX_W,
       height: DEBUG_PLAIN_GEOMETRY ? 288 : Math.min(boxHeight(shown), avail),
-      // PROBE 4: 0, not 2. With height 288 and this at 0, the container is now
-      // byte-for-byte what transcriptContainer() builds — the one container in
-      // this app that reliably paints text. Nonzero borderWidth is the ONLY
-      // property the assistant box ever had that no rendering container in
-      // this app has: transcript, Plex header and menu header are all 0.
-      borderWidth: DEBUG_PLAIN_GEOMETRY ? 0 : 2,
+      // Back to 2 for this round. Text is absent with the border at 0 AND at
+      // 2, so the border is not the variable any more — but a visible frame
+      // is how you confirm the page is up while reading the diagnostics on
+      // the phone.
+      borderWidth: 2,
       borderColor: DEBUG_PLAIN_GEOMETRY ? 5 : BOX_BORDER_COLOR,
       borderRadius: DEBUG_PLAIN_GEOMETRY ? 0 : 4,
       paddingLength: DEBUG_PLAIN_GEOMETRY ? 4 : BOX_PADDING,

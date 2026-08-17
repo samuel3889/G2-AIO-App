@@ -214,8 +214,6 @@ if (stt) {
 async function renderAssistant(s: AssistantState) {
   const boxes = assistantBox(s)
   const body = boxes[0]?.content ?? ''
-  // If this logs a non-empty string and the lens is still blank, the text is
-  // not the problem — the container is being built without painting.
   console.log(`[assist] ${s.phase} content=${JSON.stringify(body)}`)
 
   const ok = await bridge.rebuildPageContainer(
@@ -224,34 +222,43 @@ async function renderAssistant(s: AssistantState) {
       textObject: boxes,
     }),
   )
+
+  // Paint the text INTO the container the rebuild just made.
+  let up: boolean | string = 'skipped'
+  if (ok) {
+    up = await bridge.textContainerUpgrade(
+      new TextContainerUpgrade({
+        // Read off the container that was just built, rather than from the
+        // constants: the probes in overlay.ts can change the ID or name, and
+        // an upgrade aimed at a container that is not on the page does
+        // nothing at all — silently.
+        containerID: boxes[0]?.containerID ?? OVERLAY_Q_ID,
+        containerName: boxes[0]?.containerName ?? OVERLAY_NAME,
+        content: body,
+      }),
+    )
+  }
+
+  // DIAGNOSTIC — the two return values we have never actually seen.
+  //
+  // Both of these calls return a boolean, and every conclusion in this
+  // debugging session has ASSUMED both were true. This reports them to the
+  // PHONE status line rather than the console, because that needs no tooling:
+  // read it off the phone screen while the box is on the lens.
+  setStatus(
+    'listening',
+    `DBG ${s.phase} rebuild=${ok} upgrade=${up} id=${boxes[0]?.containerID}` +
+      ` name=${boxes[0]?.containerName} len=${body.length}`,
+  )
+  console.log(`[assist] rebuild=${ok} upgrade=${up}`)
+
   if (!ok) {
     // A z-order violation fails HERE, client-side, without ever reaching the
     // glasses — the SDK logs `[EvenHub:MISSING_Z_ORDER_INDEX]` or similar to
-    // the console and returns false. Check the console before assuming this
-    // is a display problem.
-    setStatus('error', 'rebuildPageContainer failed (assistant) — check console for [EvenHub:...]')
+    // the console and returns false.
     console.error('Failed to build assistant overlay')
     return
   }
-  // Paint the text INTO the container the rebuild just made.
-  //
-  // The caption page has always worked this way without it being obvious:
-  // showCaptions() rebuilds and then sets lastRender = '', which forces
-  // scheduleGlassesRender() to push a textContainerUpgrade a moment later —
-  // so on that page something always writes the text after the rebuild. The
-  // overlay had no equivalent, and came up empty. This is the same two-step,
-  // done explicitly.
-  await bridge.textContainerUpgrade(
-    new TextContainerUpgrade({
-      // Read off the container that was just built, rather than from the
-      // constants: the probes in overlay.ts can change the ID or name, and
-      // an upgrade aimed at a container that is not on the page does
-      // nothing at all — silently.
-      containerID: boxes[0]?.containerID ?? OVERLAY_Q_ID,
-      containerName: boxes[0]?.containerName ?? OVERLAY_NAME,
-      content: body,
-    }),
-  )
 
   // The transcript container is not on the page at all now, so the debounced
   // renderer's idea of what is on the lens is stale.
