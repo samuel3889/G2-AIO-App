@@ -40,8 +40,11 @@ export const OVERLAY_Q_ID = 6
 // so nothing else claims 7 and collides if a second box ever comes back.
 export const OVERLAY_A_ID = 7
 
-// containerName is capped at 16 characters.
-const OVERLAY_NAME = 'assist'
+// containerName is capped at 16 characters. Exported because
+// textContainerUpgrade has to name the same container this module built —
+// two copies of the string would drift apart and the upgrade would silently
+// target nothing.
+export const OVERLAY_NAME = 'assist'
 
 const SCREEN_W = 576
 const SCREEN_H = 288

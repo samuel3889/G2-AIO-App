@@ -9,7 +9,7 @@ import { startSttStream, type SessionState, type AssistantState } from './asr/st
 import { mountUi, setStatus, setTranscript } from './ui'
 import { mountSettings } from './settings'
 import { showPlexPage, showTranscriptPage } from './plex'
-import { assistantBox } from './overlay'
+import { assistantBox, OVERLAY_Q_ID, OVERLAY_NAME } from './overlay'
 import { RebuildPageContainer } from '@evenrealities/even_hub_sdk'
 import { showMenuPage, MENU_ACTIONS, menuLabels, type MenuAction } from './menu'
 import { mountSessions, setLiveSession, refreshSessions } from './sessions'
@@ -213,6 +213,10 @@ if (stt) {
  */
 async function renderAssistant(s: AssistantState) {
   const boxes = assistantBox(s)
+  const body = boxes[0]?.content ?? ''
+  // If this logs a non-empty string and the lens is still blank, the text is
+  // not the problem — the container is being built without painting.
+  console.log(`[assist] ${s.phase} content=${JSON.stringify(body)}`)
 
   const ok = await bridge.rebuildPageContainer(
     new RebuildPageContainer({
@@ -229,6 +233,22 @@ async function renderAssistant(s: AssistantState) {
     console.error('Failed to build assistant overlay')
     return
   }
+  // Paint the text INTO the container the rebuild just made.
+  //
+  // The caption page has always worked this way without it being obvious:
+  // showCaptions() rebuilds and then sets lastRender = '', which forces
+  // scheduleGlassesRender() to push a textContainerUpgrade a moment later —
+  // so on that page something always writes the text after the rebuild. The
+  // overlay had no equivalent, and came up empty. This is the same two-step,
+  // done explicitly.
+  await bridge.textContainerUpgrade(
+    new TextContainerUpgrade({
+      containerID: OVERLAY_Q_ID,
+      containerName: OVERLAY_NAME,
+      content: body,
+    }),
+  )
+
   // The transcript container is not on the page at all now, so the debounced
   // renderer's idea of what is on the lens is stale.
   lastRender = ''
