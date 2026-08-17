@@ -163,6 +163,37 @@ const DEBUG_BOX_TEXT: string | null = 'TEST'
  */
 const DEBUG_PLAIN_GEOMETRY = true
 
+/**
+ * TEMPORARY DEBUG PROBE 3.
+ *
+ * When true, the box is built as containerID 1 / 'transcript' — the exact
+ * identity created by createStartUpPageContainer at boot, and the only
+ * container in this app that has ever been written to successfully by
+ * textContainerUpgrade.
+ *
+ * What is left to explain: with probe 2 the box had the transcript's
+ * geometry and still rendered no text, so position, width, border and
+ * padding are all cleared. The remaining differences between it and a
+ * container that works are its ID/name, and the fact that the overlay page
+ * carries a single container while the Plex and menu pages carry two.
+ * This tests the first of those.
+ *
+ *   TEST appears -> a text container invented by rebuildPageContainer cannot
+ *                   be written to; the overlay must reuse ID 1, and the
+ *                   whole OVERLAY_Q_ID idea goes away.
+ *   still blank  -> ID is not it either, and the last variable is the
+ *                   single-container page: next probe adds a second, dummy
+ *                   container so the overlay page has the same shape as the
+ *                   Plex and menu pages that do render.
+ */
+const DEBUG_TRANSCRIPT_IDENTITY = true
+
+// Kept in sync with plex.ts's TRANSCRIPT_ID / TRANSCRIPT_NAME by hand: this
+// is probe scaffolding, not permanent, and importing plex.ts here just to
+// read two constants would couple the layout module to the page module.
+const PROBE_ID = 1
+const PROBE_NAME = 'transcript'
+
 /** Border colour 0-16. One border now, for the whole exchange. */
 const BOX_BORDER_COLOR = 12
 
@@ -263,12 +294,12 @@ export function assistantBox(s: AssistantState): TextContainerProperty[] {
       yPosition: DEBUG_PLAIN_GEOMETRY ? 0 : BOX_TOP,
       width: DEBUG_PLAIN_GEOMETRY ? SCREEN_W : BOX_W,
       height: Math.min(boxHeight(shown), avail),
-      borderWidth: DEBUG_PLAIN_GEOMETRY ? 0 : 2,
+      borderWidth: 2,
       borderColor: DEBUG_PLAIN_GEOMETRY ? 5 : BOX_BORDER_COLOR,
       borderRadius: DEBUG_PLAIN_GEOMETRY ? 0 : 4,
       paddingLength: DEBUG_PLAIN_GEOMETRY ? 4 : BOX_PADDING,
-      containerID: OVERLAY_Q_ID,
-      containerName: OVERLAY_NAME,
+      containerID: DEBUG_TRANSCRIPT_IDENTITY ? PROBE_ID : OVERLAY_Q_ID,
+      containerName: DEBUG_TRANSCRIPT_IDENTITY ? PROBE_NAME : OVERLAY_NAME,
       // Only container on the overlay page, so depth 0 of 1.
       zOrderIndex: zFor(0, 1),
       // Exactly one container per page captures events, and while the
