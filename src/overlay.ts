@@ -293,7 +293,7 @@ export function assistantBox(s: AssistantState): TextContainerProperty[] {
       xPosition: DEBUG_PLAIN_GEOMETRY ? 0 : BOX_MARGIN_X,
       yPosition: DEBUG_PLAIN_GEOMETRY ? 0 : BOX_TOP,
       width: DEBUG_PLAIN_GEOMETRY ? SCREEN_W : BOX_W,
-      height: Math.min(boxHeight(shown), avail),
+      height: DEBUG_PLAIN_GEOMETRY ? 288 : Math.min(boxHeight(shown), avail),
       borderWidth: 2,
       borderColor: DEBUG_PLAIN_GEOMETRY ? 5 : BOX_BORDER_COLOR,
       borderRadius: DEBUG_PLAIN_GEOMETRY ? 0 : 4,
