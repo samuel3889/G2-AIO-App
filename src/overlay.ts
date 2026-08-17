@@ -124,7 +124,8 @@ export const CHARS_PER_LINE = 30
 export const LINE_HEIGHT = 28
 
 /**
- * TEMPORARY DEBUG PROBE — set back to null once we know the answer.
+* TEMPORARY DEBUG PROBE — leave as 'TEST' for ONE run to confirm the
+ * content fix, then set to null.
  *
  * When this is a string, the box renders THAT and nothing else: seven ASCII
  * characters, one line, no newlines, no curly quotes, no ellipsis. The real
@@ -137,7 +138,7 @@ export const LINE_HEIGHT = 28
  *   still blank   -> the content is irrelevant; the container itself is not
  *                    rendering, and geometry/ID/border is where to look next.
  */
-const DEBUG_BOX_TEXT: string | null = 'TEST'
+const DEBUG_BOX_TEXT: string | null = null
 
 /**
  * TEMPORARY DEBUG PROBE 2.
@@ -161,7 +162,7 @@ const DEBUG_BOX_TEXT: string | null = 'TEST'
  *                   container ID: reuse 1/'transcript' and see if the same
  *                   box renders under the identity the OS already knows.
  */
-const DEBUG_PLAIN_GEOMETRY = true
+const DEBUG_PLAIN_GEOMETRY = false
 
 /**
  * TEMPORARY DEBUG PROBE 3.
@@ -186,7 +187,7 @@ const DEBUG_PLAIN_GEOMETRY = true
  *                   container so the overlay page has the same shape as the
  *                   Plex and menu pages that do render.
  */
-const DEBUG_TRANSCRIPT_IDENTITY = true
+const DEBUG_TRANSCRIPT_IDENTITY = false
 
 // Kept in sync with plex.ts's TRANSCRIPT_ID / TRANSCRIPT_NAME by hand: this
 // is probe scaffolding, not permanent, and importing plex.ts here just to
@@ -304,6 +305,11 @@ export function assistantBox(s: AssistantState): TextContainerProperty[] {
       paddingLength: DEBUG_PLAIN_GEOMETRY ? 4 : BOX_PADDING,
       containerID: DEBUG_TRANSCRIPT_IDENTITY ? PROBE_ID : OVERLAY_Q_ID,
       containerName: DEBUG_TRANSCRIPT_IDENTITY ? PROBE_NAME : OVERLAY_NAME,
+      // THE BUG: `shown` was computed above and then never passed. The
+      // container went to the lens with no `content` at all, so the box
+      // drew and stayed empty — and main.ts reads `boxes[0].content` to
+      // build its textContainerUpgrade, so the upgrade sent '' too.
+      content: shown,
       // Only container on the overlay page, so depth 0 of 1.
       zOrderIndex: zFor(0, 1),
       // Exactly one container per page captures events, and while the
