@@ -58,9 +58,10 @@ export interface SttResult {
 /**
  * The assistant exchange, as structured data rather than one blob of text.
  *
- * main.ts needs the question and the answer SEPARATELY so it can render them
- * as two boxes with different borders — collapsing them into a single string
- * here would throw away the distinction the display depends on.
+ * main.ts needs the question and the answer SEPARATELY even though overlay.ts
+ * now draws them in ONE growing box: it decides the spacing between them and
+ * clamps the answer to fit the lens. Collapsing them into a single string
+ * here would take that decision away from the module that owns the layout.
  */
 export interface AssistantState {
   phase: 'listening' | 'question' | 'thinking' | 'answer'
@@ -89,9 +90,22 @@ const GATEWAY_URL = import.meta.env.VITE_GATEWAY_URL as string
 // not lose anything from the saved file.
 const MAX_CHARS = 4000
 
-// How long an answer stays on the lens before captions resume. Long enough
-// to read two short sentences without feeling stuck.
-const ANSWER_HOLD_MS = 12000
+// How long the exchange stays on the lens after an answer, AND how long a
+// follow-up is accepted for. The two are the same number deliberately: the
+// window the user can see is the window they can talk into. When it lapses
+// the box goes and the interaction is over.
+//
+// The gateway's own CONVO_ARM_S must be set to match (its default is 45s).
+// It is not timer-driven server-side, so it would otherwise stay armed after
+// the box is gone and answer a follow-up with nothing on the lens to show
+// it — which is why the timeout below sends 'endconvo' rather than just
+// clearing the display.
+const ANSWER_HOLD_MS = 10000
+
+// How long a bare wake phrase stays armed waiting for the question to arrive
+// as a separate utterance. Pairs with WAKE_ARM_S on the gateway (default 8s);
+// this is the DISPLAY side of that window, so it is a little longer.
+const LISTEN_HOLD_MS = 10000
 
 // A summary is long and arrives without warning. Give it longer than an
 // answer, and let a tap dismiss it early.
@@ -295,7 +309,7 @@ export function startSttStream(
             overlayTimer = null
             hooks.onAssistant?.(null)
             onResult({ finalText, interimText: '' })
-          }, 10000)
+          }, LISTEN_HOLD_MS)
           emitAssistant('listening')
           break
 
@@ -330,6 +344,12 @@ export function startSttStream(
             emitAssistant('answer', msg.text ?? '')
             if (overlayTimer !== null) clearTimeout(overlayTimer)
             overlayTimer = window.setTimeout(() => {
+              // Close the follow-up window on the GATEWAY too, not just on
+              // the lens. app.py handles 'endconvo' by dropping the history
+              // and disarming; without it the gateway stays armed for the
+              // rest of CONVO_ARM_S and would route the next thing said in
+              // the room to the LLM with no box on screen.
+              sendCmd('endconvo')
               overlay = null
               overlayTimer = null
               hooks.onAssistant?.(null)
