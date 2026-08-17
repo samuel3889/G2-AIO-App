@@ -123,6 +123,22 @@ export const CHARS_PER_LINE = 30
  */
 export const LINE_HEIGHT = 28
 
+/**
+ * TEMPORARY DEBUG PROBE — set back to null once we know the answer.
+ *
+ * When this is a string, the box renders THAT and nothing else: seven ASCII
+ * characters, one line, no newlines, no curly quotes, no ellipsis. The real
+ * content has all four of those, and the Plex header and menu labels — which
+ * DO render — have none of them.
+ *
+ * Reading the result:
+ *   TEST visible  -> the container, geometry, ID and border are all fine, and
+ *                    something in the CONTENT string is what blanks the box.
+ *   still blank   -> the content is irrelevant; the container itself is not
+ *                    rendering, and geometry/ID/border is where to look next.
+ */
+const DEBUG_BOX_TEXT: string | null = 'TEST'
+
 /** Border colour 0-16. One border now, for the whole exchange. */
 const BOX_BORDER_COLOR = 12
 
@@ -204,7 +220,7 @@ export function assistantBox(s: AssistantState): TextContainerProperty[] {
 
   // A blank line between the two so the reply is visually separate from the
   // question without a second border to separate it.
-  const body = aText ? `${qText}\n\n${aText}` : qText
+  const body = DEBUG_BOX_TEXT ?? (aText ? `${qText}\n\n${aText}` : qText)
 
   // Clamp: trim until the box fits above the bottom margin.
   const avail = MAX_BOX_BOTTOM - BOX_TOP
