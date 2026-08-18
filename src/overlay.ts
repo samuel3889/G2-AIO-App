@@ -33,6 +33,7 @@
  *    a real lens - see the note on each.
  */
 import { TextContainerProperty } from '@evenrealities/even_hub_sdk'
+import { STATUS_H } from './statusbar'
 
 // Container IDs. 1 transcript, 2/3 plex, 4/5 menu, 6 overlay.
 export const OVERLAY_Q_ID = 6
@@ -105,7 +106,30 @@ export function zFor(depth: number, total: number): number {
 // --- geometry ---------------------------------------------------------------
 
 const BOX_MARGIN_X = 28
-const BOX_TOP = 20
+
+/**
+ * Gap between the bottom of the status strip and the top of the box.
+ *
+ * THIS is the knob for the box's vertical position. BOX_TOP is derived from
+ * it so the box can never be tuned back on top of the clock: raise BOX_GAP
+ * to push the box further down, lower it to tighten against the strip. 0
+ * puts the border flush under the strip.
+ */
+const BOX_GAP = 8
+
+/** Top edge of the box. Always below the strip, by construction. */
+const BOX_TOP = STATUS_H + BOX_GAP
+
+/**
+ * Bottom margin, INDEPENDENT of BOX_TOP.
+ *
+ * These used to be the same number (MAX_BOX_BOTTOM was SCREEN_H - BOX_TOP),
+ * which meant pushing the box down to clear the strip also raised its floor
+ * by the same amount and cost a long answer two lines at both ends. Tune
+ * this one on its own if answers are getting clipped.
+ */
+const BOX_BOTTOM_MARGIN = 20
+
 const BOX_PADDING = 6
 const BOX_W = SCREEN_W - BOX_MARGIN_X * 2
 
@@ -199,7 +223,7 @@ const PROBE_NAME = 'transcript'
 const BOX_BORDER_COLOR = 12
 
 // Never let a very long answer push the box off screen.
-const MAX_BOX_BOTTOM = SCREEN_H - BOX_TOP
+const MAX_BOX_BOTTOM = SCREEN_H - BOX_BOTTOM_MARGIN
 
 // --- content ----------------------------------------------------------------
 

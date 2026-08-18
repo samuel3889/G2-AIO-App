@@ -30,6 +30,7 @@ import {
   ListContainerProperty,
   ListItemContainerProperty,
 } from '@evenrealities/even_hub_sdk'
+import { statusContainers, STATUS_H } from './statusbar'
 
 // Container IDs. 1 is the transcript, 2/3 are the Plex header and list
 // (see plex.ts). The menu takes 4 and 5 so no page ever reuses an ID that
@@ -97,7 +98,8 @@ export async function showMenuPage(
 
   const header = new TextContainerProperty({
     xPosition: 0,
-    yPosition: 0,
+    // Below the persistent status strip, not under it.
+    yPosition: STATUS_H,
     width: 576,
     height: HEADER_HEIGHT,
     borderWidth: 0,
@@ -114,9 +116,9 @@ export async function showMenuPage(
 
   const list = new ListContainerProperty({
     xPosition: 0,
-    yPosition: HEADER_HEIGHT,
+    yPosition: STATUS_H + HEADER_HEIGHT,
     width: 576,
-    height: 288 - HEADER_HEIGHT,
+    height: 288 - STATUS_H - HEADER_HEIGHT,
     borderWidth: 0,
     paddingLength: 4,
     containerID: MENU_LIST_ID,
@@ -132,10 +134,16 @@ export async function showMenuPage(
     isEventCapture: 1,
   })
 
+  // The strip is rebuilt with the page: rebuildPageContainer replaces EVERY
+  // container, so a page that omits it loses the clock and battery.
+  const text = [header, ...statusContainers()]
+
+  // containerTotalNum counts EVERY container on the page, across textObject
+  // and listObject together - not just the text ones.
   return bridge.rebuildPageContainer(
     new RebuildPageContainer({
-      containerTotalNum: 2,
-      textObject: [header],
+      containerTotalNum: text.length + 1,
+      textObject: text,
       listObject: [list],
     }),
   )

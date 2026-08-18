@@ -18,6 +18,7 @@ import {
   ListContainerProperty,
   ListItemContainerProperty,
 } from '@evenrealities/even_hub_sdk'
+import { statusContainers, STATUS_H } from './statusbar'
 
 // Hard caps from index.d.ts / SDK docs: max 20 items, 64 chars each.
 // The gateway also truncates by PLEX_LINE_CHARS for visual width; this is
@@ -53,12 +54,14 @@ const PLEX_LIST_NAME = 'plex-list'
 export function transcriptContainer(
   content: string,
   isEventCapture = 1,
-  height = 288,
+  height = 288 - STATUS_H,
   zOrderIndex = 0,
 ): TextContainerProperty {
   return new TextContainerProperty({
     xPosition: 0,
-    yPosition: 0,
+    // Pushed down by the persistent status strip, which occupies the top
+    // STATUS_H px of every page in this app.
+    yPosition: STATUS_H,
     width: 576,
     height,
     borderWidth: 0,
@@ -85,10 +88,14 @@ export async function showTranscriptPage(
   bridge: { rebuildPageContainer: (c: RebuildPageContainer) => Promise<boolean> },
   content: string,
 ): Promise<boolean> {
+  // The strip is rebuilt with the page: rebuildPageContainer replaces
+  // EVERY container, so a page that omits it loses the clock and battery.
+  const text = [transcriptContainer(content, 1), ...statusContainers()]
+
   return bridge.rebuildPageContainer(
     new RebuildPageContainer({
-      containerTotalNum: 1,
-      textObject: [transcriptContainer(content, 1)],
+      containerTotalNum: text.length,
+      textObject: text,
     }),
   )
 }
@@ -116,7 +123,8 @@ export async function showPlexPage(
 
   const headerContainer = new TextContainerProperty({
     xPosition: 0,
-    yPosition: 0,
+    // Below the status strip, not under it.
+    yPosition: STATUS_H,
     width: 576,
     height: HEADER_HEIGHT,
     borderWidth: 0,
@@ -135,9 +143,9 @@ export async function showPlexPage(
 
   const list = new ListContainerProperty({
     xPosition: 0,
-    yPosition: HEADER_HEIGHT,
+    yPosition: STATUS_H + HEADER_HEIGHT,
     width: 576,
-    height: 288 - HEADER_HEIGHT,
+    height: 288 - STATUS_H - HEADER_HEIGHT,
     borderWidth: 0,
     paddingLength: 4,
     containerID: PLEX_LIST_ID,
@@ -159,10 +167,14 @@ export async function showPlexPage(
     isEventCapture: 1,
   })
 
+  const text = [headerContainer, ...statusContainers()]
+
+  // containerTotalNum counts EVERY container on the page, across
+  // textObject and listObject together - not just the text ones.
   return bridge.rebuildPageContainer(
     new RebuildPageContainer({
-      containerTotalNum: 2,
-      textObject: [headerContainer],
+      containerTotalNum: text.length + 1,
+      textObject: text,
       listObject: [list],
     }),
   )

@@ -13,7 +13,7 @@ import { assistantBox, OVERLAY_Q_ID, OVERLAY_NAME } from './overlay'
 import { RebuildPageContainer } from '@evenrealities/even_hub_sdk'
 import { showMenuPage, MENU_ACTIONS, menuLabels, type MenuAction } from './menu'
 import { mountSessions, setLiveSession, refreshSessions } from './sessions'
-import { statusContainers, STATUS_H, type StatusState } from './statusbar'
+import { statusContainers, setDeviceStatus, STATUS_H } from './statusbar'
 
 mountSettings()
 mountUi()
@@ -26,17 +26,17 @@ if (!API_KEY) {
 
 const bridge = await waitForEvenAppBridge()
 
-// Live device status, mirrored from the host. Read once at boot below; step 2
-// will keep it current via onDeviceStatusChanged.
-const status: StatusState = {}
-
+// Seed the status strip before the first page is built.
+//
 // getDeviceInfo() returns DeviceInfo | null (index.d.ts:1130), and
 // DeviceStatus.batteryLevel is OPTIONAL (index.d.ts:139) — it can legitimately
 // be undefined this early, in which case the strip shows '--%'.
 try {
   const device = await bridge.getDeviceInfo()
-  status.batteryLevel = device?.status?.batteryLevel
-  status.isCharging = device?.status?.isCharging
+  setDeviceStatus({
+    batteryLevel: device?.status?.batteryLevel,
+    isCharging: device?.status?.isCharging,
+  })
   console.log(
     `[status] boot device sn=${device?.sn} battery=${device?.status?.batteryLevel}` +
       ` charging=${device?.status?.isCharging}`,
@@ -63,11 +63,11 @@ const transcript = new TextContainerProperty({
   // are both 0, so this stays 1.
   isEventCapture: 1,
   // Backmost. zOrderIndex is ALL-OR-NOTHING per page, and the status
-  // containers set 1 and 2, so this one must be set too.
+  // containers set 10 and 11, so this one must be set too.
   zOrderIndex: 0,
 })
 
-const startupText = [transcript, ...statusContainers(status)]
+const startupText = [transcript, ...statusContainers()]
 
 const created = await bridge.createStartUpPageContainer(
   new CreateStartUpPageContainer({
@@ -245,10 +245,15 @@ async function renderAssistant(s: AssistantState) {
   const body = boxes[0]?.content ?? ''
   console.log(`[assist] ${s.phase} content=${JSON.stringify(body)}`)
 
+  // The strip goes on this page too. Note this ALSO changes the overlay from
+  // a one-container page to a three-container one — which is the exact
+  // variable the last overlay probe was left waiting on.
+  const text = [...boxes, ...statusContainers()]
+
   const ok = await bridge.rebuildPageContainer(
     new RebuildPageContainer({
-      containerTotalNum: boxes.length,
-      textObject: boxes,
+      containerTotalNum: text.length,
+      textObject: text,
     }),
   )
 
