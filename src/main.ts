@@ -13,6 +13,7 @@ import { assistantBox, OVERLAY_Q_ID, OVERLAY_NAME } from './overlay'
 import { RebuildPageContainer } from '@evenrealities/even_hub_sdk'
 import { showMenuPage, MENU_ACTIONS, menuLabels, type MenuAction } from './menu'
 import { mountSessions, setLiveSession, refreshSessions } from './sessions'
+import { statusContainers, STATUS_H, type StatusState } from './statusbar'
 
 mountSettings()
 mountUi()
@@ -25,26 +26,54 @@ if (!API_KEY) {
 
 const bridge = await waitForEvenAppBridge()
 
+// Live device status, mirrored from the host. Read once at boot below; step 2
+// will keep it current via onDeviceStatusChanged.
+const status: StatusState = {}
+
+// getDeviceInfo() returns DeviceInfo | null (index.d.ts:1130), and
+// DeviceStatus.batteryLevel is OPTIONAL (index.d.ts:139) — it can legitimately
+// be undefined this early, in which case the strip shows '--%'.
+try {
+  const device = await bridge.getDeviceInfo()
+  status.batteryLevel = device?.status?.batteryLevel
+  status.isCharging = device?.status?.isCharging
+  console.log(
+    `[status] boot device sn=${device?.sn} battery=${device?.status?.batteryLevel}` +
+      ` charging=${device?.status?.isCharging}`,
+  )
+} catch (err) {
+  console.warn('[status] getDeviceInfo failed:', err)
+}
+
 const transcript = new TextContainerProperty({
   xPosition: 0,
-  yPosition: 0,
+  // Pushed down by the status strip. Overlapping containers would depend on
+  // z-order behaviour that is still unverified in this app, so the strip gets
+  // its own reserved band instead.
+  yPosition: STATUS_H,
   width: 576,
-  height: 288,
+  height: 288 - STATUS_H,
   borderWidth: 0,
   borderColor: 5,
   paddingLength: 4,
   containerID: 1,
   containerName: 'transcript',
   content: 'Listening…',
+  // Exactly one container per page may capture events; the status containers
+  // are both 0, so this stays 1.
   isEventCapture: 1,
-  // Only container on the startup page, so any finite value works — but it
-  // must be present if any sibling ever has one. Single container here, so
-  // 0 is both valid and unambiguous.
+  // Backmost. zOrderIndex is ALL-OR-NOTHING per page, and the status
+  // containers set 1 and 2, so this one must be set too.
   zOrderIndex: 0,
 })
 
+const startupText = [transcript, ...statusContainers(status)]
+
 const created = await bridge.createStartUpPageContainer(
-  new CreateStartUpPageContainer({ containerTotalNum: 1, textObject: [transcript] }),
+  new CreateStartUpPageContainer({
+    containerTotalNum: startupText.length,
+    textObject: startupText,
+  }),
 )
 if (created !== 0) {
   setStatus('error', `createStartUpPageContainer failed: ${created}`)
