@@ -74,11 +74,25 @@ const PADDING = 2
 // "10:42 AM" is 8 chars; 200px leaves slack for a two-digit hour.
 const CLOCK_W = 200
 
-// "100%" / "+100%" is at most 5 chars => ~95px. There is no text-alignment
-// property on TextContainerProperty, so the only way to get the battery
-// near the right edge is to make the box narrow and push it right; a
-// shorter string like "87%" will sit a few px left of the edge.
-const BATTERY_W = 100
+/**
+ * Width of the battery container. THIS is the knob for how flush right the
+ * percentage sits.
+ *
+ * There is no text-alignment property on TextContainerProperty, so content
+ * is always drawn from the LEFT edge of its container. The container's
+ * right edge is pinned to the screen edge below, so the gap you see to the
+ * right of "100%" is empty space inside the container: the narrower this
+ * is, the further right the text starts.
+ *
+ * Was 100, sized off a 19px/char estimate that the lens showed to be about
+ * double the real glyph width. 56 fits the longest string this ever renders
+ * ("+100%", 5 chars) with the padding.
+ *
+ * To tune: too much gap at the right -> lower. Digits clipped or the '%'
+ * missing when the battery hits 100 -> raise. Check it at a 3-digit value,
+ * not at "87%".
+ */
+const BATTERY_W = 56
 
 export interface StatusState {
   /** 0-100, or undefined before the first device status arrives. */

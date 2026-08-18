@@ -134,16 +134,33 @@ const BOX_PADDING = 6
 const BOX_W = SCREEN_W - BOX_MARGIN_X * 2
 
 /**
- * UNVERIFIED. 30 matches the PLEX_LINE_CHARS default in app.py, which is
- * itself a guess that was tuned by eye. Calibrate the same way: put a long
- * answer up, raise until a line wraps early, then back off one.
+ * Characters that fit on one line. THIS is the knob for trailing empty
+ * space in the box.
+ *
+ * countLines() uses it to decide how tall the box must be, so a value that
+ * is too LOW makes a one-line answer count as two and reserves an extra
+ * LINE_HEIGHT of blank space under the text. Too HIGH and the last line
+ * gets clipped instead.
+ *
+ * Was 30, copied from PLEX_LINE_CHARS in app.py - a different font context,
+ * and measurably wrong here: a 48-character answer rendered on one line, so
+ * the real figure is somewhere near 56. 50 leaves headroom, because the
+ * font is proportional and a line of wide glyphs runs longer than an
+ * average one while this counts every character the same.
+ *
+ * To tune: put up a long answer. Blank space under the last line -> raise.
+ * Last line clipped -> lower.
  */
-export const CHARS_PER_LINE = 30
+export const CHARS_PER_LINE = 52
 
 /**
- * UNVERIFIED. No font metrics exist anywhere in the SDK. If boxes come out
- * too tall (empty space under the last line) lower this; if text is clipped
- * at the bottom, raise it.
+ * Height of one text line, in px. The SECOND knob for box height.
+ *
+ * UNVERIFIED - no font metrics exist anywhere in the SDK. CHARS_PER_LINE
+ * above controls how many lines the box thinks it needs; this controls how
+ * tall each one is. Fix the line COUNT first, then trim this if there is
+ * still slack: a wrong value here is off by a few px per line, a wrong
+ * value there is off by a whole line at once.
  */
 export const LINE_HEIGHT = 28
 
