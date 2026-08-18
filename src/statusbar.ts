@@ -17,7 +17,11 @@
  * All container models are CLASS INSTANCES (`new X({...})`), matching
  * index.d.ts where every one declares `constructor(data?: Partial<X>)`.
  */
-import { TextContainerProperty } from '@evenrealities/even_hub_sdk'
+import {
+  TextContainerProperty,
+  TextContainerUpgrade,
+  type DeviceStatus,
+} from '@evenrealities/even_hub_sdk'
 
 export const SCREEN_W = 576
 export const SCREEN_H = 288
@@ -104,6 +108,31 @@ export interface StatusState {
 // every page build.
 let deviceStatus: StatusState = {}
 
+/**
+ * What is currently ON THE LENS in each container, as far as we know.
+ *
+ * Written both by statusContainers() (which bakes content in at build time)
+ * and by the upgrade helpers below, so a page rebuild cannot leave these
+ * stale and trigger a pointless write on the next tick.
+ */
+let lastClockText = ''
+let lastBatteryText = ''
+
+/**
+ * Serial number of the glasses, captured at boot.
+ *
+ * onDeviceStatusChanged fires for whichever device changed, and DeviceInfo
+ * declares both isGlasses() and isRing() (index.d.ts) - so a ring would
+ * otherwise overwrite the glasses battery reading. Empty means we never got
+ * a device at boot, in which case everything is accepted.
+ */
+let glassesSn = ''
+
+/** Record the serial number to match later status events against. */
+export function setGlassesSn(sn?: string): void {
+  glassesSn = sn ?? ''
+}
+
 /** Record a new device status. Does not repaint anything by itself. */
 export function setDeviceStatus(s: StatusState): void {
   deviceStatus = s
@@ -156,7 +185,7 @@ export function statusContainers(now: Date = new Date()): TextContainerProperty[
       paddingLength: PADDING,
       containerID: CLOCK_ID,
       containerName: CLOCK_NAME,
-      content: clockText(now),
+      content: (lastClockText = clockText(now)),
       isEventCapture: 0,
       zOrderIndex: CLOCK_Z,
     }),
@@ -170,9 +199,102 @@ export function statusContainers(now: Date = new Date()): TextContainerProperty[
       paddingLength: PADDING,
       containerID: BATTERY_ID,
       containerName: BATTERY_NAME,
-      content: batteryText(),
+      content: (lastBatteryText = batteryText()),
       isEventCapture: 0,
       zOrderIndex: BATTERY_Z,
     }),
   ]
+}
+
+// --- live updates -----------------------------------------------------------
+
+/**
+ * The two bridge methods this module needs, declared structurally rather
+ * than by importing EvenAppBridge - same approach as showPlexPage and
+ * showMenuPage, which take the one method they call.
+ */
+export interface StatusBridge {
+  textContainerUpgrade: (c: TextContainerUpgrade) => Promise<boolean>
+  onDeviceStatusChanged: (cb: (status: DeviceStatus) => void) => () => void
+}
+
+/**
+ * How often to CHECK the clock, not how often to write it.
+ *
+ * The write only happens when the formatted string changes, so this is the
+ * worst-case lag on a minute rollover, not a write rate. 15s keeps the BLE
+ * render queue seeing about one write per minute.
+ */
+const TICK_MS = 15_000
+
+/** Push the current time to the lens if it differs from what is up. */
+async function pushClock(bridge: StatusBridge): Promise<void> {
+  const text = clockText()
+  if (text === lastClockText) return
+  const ok = await bridge.textContainerUpgrade(
+    new TextContainerUpgrade({
+      containerID: CLOCK_ID,
+      containerName: CLOCK_NAME,
+      content: text,
+    }),
+  )
+  // Only trust the cache if the write was accepted. On false the string is
+  // NOT on the lens, and the next tick should try again rather than skip.
+  if (ok) lastClockText = text
+  else console.warn(`[status] clock upgrade returned false (content=${text})`)
+}
+
+/** Push the current battery reading to the lens if it differs. */
+async function pushBattery(bridge: StatusBridge): Promise<void> {
+  const text = batteryText()
+  if (text === lastBatteryText) return
+  const ok = await bridge.textContainerUpgrade(
+    new TextContainerUpgrade({
+      containerID: BATTERY_ID,
+      containerName: BATTERY_NAME,
+      content: text,
+    }),
+  )
+  if (ok) lastBatteryText = text
+  else console.warn(`[status] battery upgrade returned false (content=${text})`)
+}
+
+/**
+ * Start keeping the strip current: a clock poll plus a device status
+ * subscription.
+ *
+ * Returns a stop function that clears both. Call it from cleanup() so the
+ * interval does not outlive the widget.
+ *
+ * NOTE this is the first thing in the app to write to a container it did
+ * not create via createStartUpPageContainer. If the clock never changes but
+ * the console stays silent, the write is being accepted and ignored; if the
+ * warnings above fire, it is being rejected.
+ */
+export function startStatusUpdates(bridge: StatusBridge): () => void {
+  const timer = window.setInterval(() => {
+    void pushClock(bridge)
+  }, TICK_MS)
+
+  const unsubscribe = bridge.onDeviceStatusChanged(status => {
+    // Ignore other devices (a ring) once we know which sn is the glasses.
+    if (glassesSn && status.sn && status.sn !== glassesSn) {
+      console.log(`[status] ignoring status for sn=${status.sn}`)
+      return
+    }
+    setDeviceStatus({
+      batteryLevel: status.batteryLevel,
+      isCharging: status.isCharging,
+    })
+    console.log(
+      `[status] update sn=${status.sn} battery=${status.batteryLevel}` +
+        ` charging=${status.isCharging}`,
+    )
+    void pushBattery(bridge)
+  })
+
+  return () => {
+    window.clearInterval(timer)
+    unsubscribe()
+  }
 }

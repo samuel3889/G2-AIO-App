@@ -13,7 +13,13 @@ import { assistantBox, OVERLAY_Q_ID, OVERLAY_NAME } from './overlay'
 import { RebuildPageContainer } from '@evenrealities/even_hub_sdk'
 import { showMenuPage, MENU_ACTIONS, menuLabels, type MenuAction } from './menu'
 import { mountSessions, setLiveSession, refreshSessions } from './sessions'
-import { statusContainers, setDeviceStatus, STATUS_H } from './statusbar'
+import {
+  statusContainers,
+  setDeviceStatus,
+  setGlassesSn,
+  startStatusUpdates,
+  STATUS_H,
+} from './statusbar'
 
 mountSettings()
 mountUi()
@@ -37,6 +43,9 @@ try {
     batteryLevel: device?.status?.batteryLevel,
     isCharging: device?.status?.isCharging,
   })
+  // Later status events are matched against this so a ring cannot overwrite
+  // the glasses battery.
+  setGlassesSn(device?.sn)
   console.log(
     `[status] boot device sn=${device?.sn} battery=${device?.status?.batteryLevel}` +
       ` charging=${device?.status?.isCharging}`,
@@ -79,6 +88,11 @@ if (created !== 0) {
   setStatus('error', `createStartUpPageContainer failed: ${created}`)
   console.error('Failed to create startup page')
 }
+
+// Keep the strip live between page rebuilds: a clock poll plus a device
+// status subscription. Stopped in cleanup() so the interval does not
+// outlive the widget.
+const stopStatusUpdates = startStatusUpdates(bridge)
 
 let lastRender = ''
 let renderTimer: number | null = null
@@ -443,6 +457,7 @@ function cleanup() {
   if (sessionActive) stt?.stopSession()
   bridge.audioControl(false)
   stt?.close()
+  stopStatusUpdates()
   unsubscribe()
 }
 
