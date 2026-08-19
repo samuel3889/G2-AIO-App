@@ -151,7 +151,7 @@ const BOX_W = SCREEN_W - BOX_MARGIN_X * 2
  * To tune: put up a long answer. Blank space under the last line -> raise.
  * Last line clipped -> lower.
  */
-export const CHARS_PER_LINE = 53
+export const CHARS_PER_LINE = 54
 
 /**
  * Height of one text line, in px. The SECOND knob for box height.

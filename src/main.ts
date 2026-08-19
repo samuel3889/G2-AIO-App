@@ -13,6 +13,8 @@ import { assistantBox, OVERLAY_Q_ID, OVERLAY_NAME } from './overlay'
 import { RebuildPageContainer } from '@evenrealities/even_hub_sdk'
 import { showMenuPage, MENU_ACTIONS, menuLabels, type MenuAction } from './menu'
 import { mountSessions, setLiveSession, refreshSessions } from './sessions'
+import { mountTabs } from './tabs'
+import { mountReview } from './review'
 import {
   statusContainers,
   setDeviceStatus,
@@ -21,8 +23,18 @@ import {
   STATUS_H,
 } from './statusbar'
 
-mountSettings()
+// Phone UI: one tab bar, three hosts. Every panel is mounted ONCE, here at
+// startup, and only shown/hidden afterwards — mountSessions() registers
+// callbacks that setLiveSession() drives, so remounting on tab switch would
+// leave those writing into detached DOM.
+//
+// mountUi() still owns #app and is NOT moved into a host: it replaces #app's
+// innerHTML wholesale, which would destroy anything mounted inside it.
+const tabs = mountTabs(['Live', 'Conversations', 'Review'])
+
+void mountSettings(tabs.Live)
 mountUi()
+mountReview(tabs.Review)
 
 const API_KEY = import.meta.env.VITE_STT_API_KEY as string
 if (!API_KEY) {
@@ -232,10 +244,13 @@ try {
 
 // Phone-side session browser. Mounted after `stt` exists so its Start/Stop
 // buttons can reach the socket.
-mountSessions({
-  start: (title?: string) => stt?.startSession(title),
-  stop: () => stt?.stopSession(),
-})
+mountSessions(
+  {
+    start: (title?: string) => stt?.startSession(title),
+    stop: () => stt?.stopSession(),
+  },
+  tabs.Conversations,
+)
 
 if (stt) {
   await bridge.audioControl(true)
