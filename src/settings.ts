@@ -14,10 +14,14 @@
  * Add one line to main.ts:
  *     import { mountSettings } from './settings'
  *     mountSettings()
+ *
+ * The gateway URL rule and the token live in api.ts. This file used to carry
+ * its own copy of restBase() plus a local url() helper; both were removed in
+ * favour of restBase()/restUrl(). Neither call site here carries a query
+ * string, so restUrl()'s `?` vs `&` handling is a no-op today and correct if
+ * one ever does.
  */
-
-const GATEWAY_URL = import.meta.env.VITE_GATEWAY_URL as string
-const TOKEN = import.meta.env.VITE_STT_API_KEY as string
+import { restBase, restUrl } from './api'
 
 interface Tunable {
   key: string
@@ -28,12 +32,6 @@ interface Tunable {
   max: number
   step: number
   unit: string
-}
-
-// The WS URL and the REST base share a host; derive one from the other so
-// there is only ever one URL to configure.
-function restBase(): string {
-  return GATEWAY_URL.replace(/^ws/, 'http').replace(/\/ws\/stt.*$/, '')
 }
 
 const CSS = `
@@ -101,13 +99,11 @@ export async function mountSettings(host?: HTMLElement) {
     state.className = err ? 'state err' : 'state'
   }
 
-  const url = (p: string) => `${restBase()}${p}?token=${encodeURIComponent(TOKEN)}`
-
   let schema: Tunable[] = []
   let values: Record<string, number> = {}
 
   async function load() {
-    const r = await fetch(url('/settings'))
+    const r = await fetch(restUrl('/settings'))
     if (!r.ok) throw new Error(`${r.status}`)
     const d = await r.json()
     schema = d.schema
@@ -126,7 +122,7 @@ export async function mountSettings(host?: HTMLElement) {
       const patch = pending
       pending = {}
       try {
-        const r = await fetch(url('/settings'), {
+        const r = await fetch(restUrl('/settings'), {
           method: 'PUT',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(patch),
@@ -239,7 +235,7 @@ export async function mountSettings(host?: HTMLElement) {
 
   ;(root.querySelector('.reset') as HTMLButtonElement).onclick = async () => {
     try {
-      const r = await fetch(url('/settings/reset'), { method: 'POST' })
+      const r = await fetch(restUrl('/settings/reset'), { method: 'POST' })
       values = (await r.json()).values
       painters.forEach(p => p())
       say('reset to .env defaults')

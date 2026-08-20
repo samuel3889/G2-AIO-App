@@ -9,14 +9,13 @@
  * Mounts to document.body, matching mountSettings() — NOT to #app, which
  * ui.ts overwrites wholesale with innerHTML.
  *
- * restBase() below is copied verbatim from settings.ts. Two copies of a URL
- * rule will eventually disagree; if you would rather have one, add `export`
- * to settings.ts's restBase and import it here instead.
+ * The gateway URL rule and the token live in api.ts. This file used to carry
+ * its own verbatim copy of restBase() plus a local url() helper; both were
+ * removed in favour of restBase()/restUrl(). api.ts's restUrl() implements
+ * the same `?` vs `&` rule the local helper did, so behaviour is unchanged.
  */
 import type { SessionState } from './asr/stt'
-
-const GATEWAY_URL = import.meta.env.VITE_GATEWAY_URL as string
-const TOKEN = import.meta.env.VITE_STT_API_KEY as string
+import { restBase, restUrl } from './api'
 
 interface StoredSession {
   id: string
@@ -30,11 +29,6 @@ interface StoredSession {
 interface Controls {
   start: (title?: string) => void
   stop: () => void
-}
-
-// Same rule as settings.ts: ^ws -> http turns wss:// into https:// too.
-function restBase(): string {
-  return GATEWAY_URL.replace(/^ws/, 'http').replace(/\/ws\/stt.*$/, '')
 }
 
 const CSS = `
@@ -69,9 +63,6 @@ let listEl: HTMLElement | null = null
 let liveEl: HTMLElement | null = null
 let recBtn: HTMLButtonElement | null = null
 let live: SessionState = { active: false, id: null, utterances: 0 }
-
-const url = (p: string) =>
-  `${restBase()}${p}${p.includes('?') ? '&' : '?'}token=${encodeURIComponent(TOKEN)}`
 
 function when(ts: number | null): string {
   // The gateway stores seconds (time.time()); JS wants milliseconds.
@@ -133,7 +124,7 @@ export function setLiveSession(s: SessionState) {
 export async function refreshSessions() {
   if (!listEl) return
   try {
-    const r = await fetch(url('/sessions'))
+    const r = await fetch(restUrl('/sessions'))
     if (!r.ok) throw new Error(`${r.status}`)
     render((await r.json()).sessions as StoredSession[])
   } catch (e) {
@@ -180,7 +171,7 @@ function render(items: StoredSession[]) {
       body.textContent = 'loading…'
       body.hidden = false
       try {
-        const r = await fetch(url(`/sessions/${s.id}/text`))
+        const r = await fetch(restUrl(`/sessions/${s.id}/text`))
         if (!r.ok) throw new Error(`${r.status}`)
         const d = await r.json()
         body.textContent = d.summary
@@ -198,7 +189,7 @@ function render(items: StoredSession[]) {
       try {
         // A local model on a long transcript can legitimately take a
         // minute. No timeout is set on purpose.
-        const r = await fetch(url(`/sessions/${s.id}/summarize`), { method: 'POST' })
+        const r = await fetch(restUrl(`/sessions/${s.id}/summarize`), { method: 'POST' })
         if (!r.ok) throw new Error(`${r.status}`)
         await refreshSessions()
       } catch (e) {
@@ -211,7 +202,7 @@ function render(items: StoredSession[]) {
     ;(row.querySelector('.del') as HTMLButtonElement).onclick = async () => {
       if (!confirm(`Delete ${s.title || s.id}?`)) return
       try {
-        const r = await fetch(url(`/sessions/${s.id}`), { method: 'DELETE' })
+        const r = await fetch(restUrl(`/sessions/${s.id}`), { method: 'DELETE' })
         if (!r.ok) throw new Error(`${r.status}`)
         await refreshSessions()
       } catch (e) {
