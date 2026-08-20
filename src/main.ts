@@ -1,15 +1,23 @@
 import {
   waitForEvenAppBridge,
-  TextContainerProperty,
   CreateStartUpPageContainer,
   TextContainerUpgrade,
   OsEventTypeList,
 } from '@evenrealities/even_hub_sdk'
 import { startSttStream, type SessionState, type AssistantState } from './asr/stt'
 import { mountUi, setStatus, setTranscript } from './ui'
-import { captionContent, resetCaptions, rulerText, CAPTION_RULER } from './captions'
+import {
+  captionColumns,
+  resetCaptions,
+  setPartial,
+  pushFinal,
+  setName,
+  rulerText,
+  CAPTION_RULER,
+} from './captions'
+import { NAMES_ID, NAMES_NAME, namesContainer } from './plex'
 import { mountSettings } from './settings'
-import { showPlexPage, showTranscriptPage } from './plex'
+import { showPlexPage, showTranscriptPage, transcriptContainer } from './plex'
 import { assistantBox, OVERLAY_Q_ID, OVERLAY_NAME } from './overlay'
 import { RebuildPageContainer } from '@evenrealities/even_hub_sdk'
 import { showMenuPage, MENU_ACTIONS, menuLabels, type MenuAction } from './menu'
@@ -21,7 +29,6 @@ import {
   setDeviceStatus,
   setGlassesSn,
   startStatusUpdates,
-  STATUS_H,
 } from './statusbar'
 
 // Phone UI: one tab bar, three hosts. Every panel is mounted ONCE, here at
@@ -69,34 +76,22 @@ try {
 
 // What the transcript container holds before anything has been said. Held in
 // a constant because it is needed in two places — the startup container built
-// below, and `currentContent`, which the debounced renderer diffs against.
-// Two literals here would mean the first render after boot was a no-op or a
+// below, and `currentText`, which the debounced renderer diffs against. Two
+// literals here would mean the first render after boot was a no-op or a
 // redundant write depending on which one drifted.
 const INITIAL_CONTENT = CAPTION_RULER ? rulerText() : 'Listening…'
 
-const transcript = new TextContainerProperty({
-  xPosition: 0,
-  // Pushed down by the status strip. Overlapping containers would depend on
-  // z-order behaviour that is still unverified in this app, so the strip gets
-  // its own reserved band instead.
-  yPosition: STATUS_H,
-  width: 576,
-  height: 288 - STATUS_H,
-  borderWidth: 0,
-  borderColor: 5,
-  paddingLength: 4,
-  containerID: 1,
-  containerName: 'transcript',
-  content: INITIAL_CONTENT,
-  // Exactly one container per page may capture events; the status containers
-  // are both 0, so this stays 1.
-  isEventCapture: 1,
-  // Backmost. zOrderIndex is ALL-OR-NOTHING per page, and the status
-  // containers set 10 and 11, so this one must be set too.
-  zOrderIndex: 0,
-})
+// GEOMETRY LIVES IN plex.ts. This used to be an inline TextContainerProperty
+// spanning the full 576, duplicating transcriptContainer()'s layout. Now that
+// the caption page is TWO columns, a second copy of the geometry would drift
+// from the one showTranscriptPage() builds and the columns would stop lining
+// up after the first rebuild.
+const transcript = transcriptContainer(INITIAL_CONTENT, 1)
 
-const startupText = [transcript, ...statusContainers()]
+// FOUR containers at startup, not three. zOrderIndex is ALL-OR-NOTHING per
+// page and unique across all of them: transcript 0, names 1, clock 10,
+// battery 11.
+const startupText = [transcript, namesContainer(''), ...statusContainers()]
 
 const created = await bridge.createStartUpPageContainer(
   new CreateStartUpPageContainer({
@@ -109,14 +104,22 @@ if (created !== 0) {
   console.error('Failed to create startup page')
 }
 
+
 // Keep the strip live between page rebuilds: a clock poll plus a device
 // status subscription. Stopped in cleanup() so the interval does not
 // outlive the widget.
 const stopStatusUpdates = startStatusUpdates(bridge)
 
-let lastRender = ''
+// Last thing actually written to each container, so an unchanged column is
+// not re-sent. The names column only changes when an utterance starts or a
+// name lands - a partial touches the text column alone - so most renders
+// stay ONE bridge call rather than two, which matters on a BLE queue slow
+// enough to need the 120ms debounce below.
+let lastNames = ''
+let lastText = ''
 let renderTimer: number | null = null
-let currentContent = INITIAL_CONTENT
+let currentNames = ''
+let currentText = INITIAL_CONTENT
 
 // Which page is on the lens. In 'plex' and 'menu' modes the transcript
 // container does not exist, so textContainerUpgrade would target a
@@ -138,6 +141,26 @@ let micOn = false
 // does not exist.
 let assistant: AssistantState | null = null
 
+// REBUILD THE CAPTION PAGE ONCE AT BOOT.
+//
+// createStartUpPageContainer above is the ONLY thing that ran at launch, and
+// a container's xPosition and width are frozen when it is created -
+// textContainerUpgrade replaces content and nothing else. So every page the
+// startup call put up kept whatever geometry was compiled in at that moment,
+// and the first rebuild only happened by accident, on the way back from a
+// Plex list or an assistant answer.
+//
+// That is what made changing NAMES_W appear to do nothing while the WRAP
+// (recomputed on the phone every render) changed immediately, and what left
+// the names column invisible until a round trip through another page.
+//
+// Doing it here means showCaptions() is the single function that ever builds
+// this page. The startup call still runs because the SDK expects a page to
+// exist before rebuildPageContainer is valid; it is now just a placeholder
+// that gets replaced immediately. One redundant rebuild at launch is a
+// cheaper price than two copies of the geometry that drift apart.
+// await showCaptions()
+
 function scheduleGlassesRender() {
   if (pageMode !== 'transcript') return
   if (assistant !== null) return
@@ -147,16 +170,52 @@ function scheduleGlassesRender() {
     // Re-check: a list may have taken over during the 120ms debounce.
     if (pageMode !== 'transcript') return
     if (assistant !== null) return
-    if (currentContent === lastRender) return
-    lastRender = currentContent
-    await bridge.textContainerUpgrade(
-      new TextContainerUpgrade({
-        containerID: 1,
-        containerName: 'transcript',
-        content: currentContent,
-      }),
-    )
+
+    // Names FIRST. If the two writes are ever split across a frame, a row
+    // showing a name with no text beside it reads better than a row of text
+    // with the wrong name beside it.
+    if (currentNames !== lastNames) {
+      lastNames = currentNames
+      await bridge.textContainerUpgrade(
+        new TextContainerUpgrade({
+          containerID: NAMES_ID,
+          containerName: NAMES_NAME,
+          content: currentNames,
+        }),
+      )
+    }
+
+    if (currentText !== lastText) {
+      lastText = currentText
+      await bridge.textContainerUpgrade(
+        new TextContainerUpgrade({
+          containerID: 1,
+          containerName: 'transcript',
+          content: currentText,
+        }),
+      )
+    }
   }, 120) // debounce display writes — BLE render queue is slow
+}
+
+/** Pull both columns out of the caption buffer and queue a render. */
+function repaintCaptions() {
+  const cols = captionColumns()
+  currentNames = cols.names
+  currentText = cols.text
+  scheduleGlassesRender()
+}
+
+/**
+ * Put a single message on the lens, with an empty name column.
+ *
+ * Used for 'Listening…' and 'Paused', which are states rather than speech
+ * and so belong to no speaker.
+ */
+function setLensMessage(msg: string) {
+  currentNames = ''
+  currentText = msg
+  scheduleGlassesRender()
 }
 
 // Phone status line. One place, because it now has to account for three
@@ -180,22 +239,16 @@ try {
   stt = startSttStream(
     API_KEY,
     ({ finalText, interimText }) => {
-      // The lens string is WRAPPED HERE, in captions.ts, rather than handed
-      // to the glasses as one long paragraph for them to wrap themselves.
+      // PHONE PANEL ONLY. The lens no longer renders from these two
+      // strings - it is driven by onPartial/onUtterance/onSpeaker below,
+      // because a flat string has nowhere to put a name that arrives after
+      // the text it belongs to.
       //
-      // The old line was `combined.slice(-240)`. Cutting from the left at an
-      // arbitrary character moved the start of the block on every single
-      // word, so the glasses re-wrapped everything and the text already on
-      // screen slid sideways while you were reading it. It also capped the
-      // display at ~4 lines for no reason other than the 240.
-      //
-      // captionContent() wraps greedily, which is prefix-stable: a word that
-      // is already on a full line cannot move. New words fill the current
-      // line left to right, and a full line scrolls the block up by exactly
-      // one row with every column preserved.
-      currentContent = captionContent(finalText, interimText)
+      // onResult still carries the assistant overlay text (showOverlay in
+      // stt.ts calls it with the answer as `finalText`), which is another
+      // reason not to feed it to the caption buffer: an answer would be
+      // appended to the conversation as though someone had said it.
       setTranscript(finalText, interimText)
-      scheduleGlassesRender()
     },
     err => {
       setStatus('error', `STT error: ${(err as Error)?.message ?? err}`)
@@ -215,6 +268,29 @@ try {
       refreshStatus()
     },
     {
+      // --- lens caption buffer ------------------------------------------
+      //
+      // Three hooks instead of one string, because the speaker name arrives
+      // AFTER the text it belongs to: gateway.py sends the 'final' frame and
+      // only then spawns run_speaker() to embed and score the audio
+      // (gateway.py:3486-3496). The buffer keeps utterances addressable by
+      // seq so the name can be filled in when it lands.
+      onPartial: (text: string) => {
+        setPartial(text)
+        repaintCaptions()
+      },
+      onUtterance: (seq: number, text: string) => {
+        pushFinal(seq, text)
+        repaintCaptions()
+      },
+      onSpeaker: (seq: number, name: string | null) => {
+        setName(seq, name)
+        // The name lives in its OWN container, so writing it in cannot
+        // change the wrap or the row count of the text beside it. This
+        // repaint swaps '?' for 'Samuel' and moves nothing else.
+        repaintCaptions()
+      },
+
       onSession: (s: SessionState) => {
         sessionActive = s.active
         sessionUtterances = s.utterances
@@ -342,9 +418,10 @@ async function renderAssistant(s: AssistantState) {
     return
   }
 
-  // The transcript container is not on the page at all now, so the debounced
+  // The caption containers are not on the page at all now, so the debounced
   // renderer's idea of what is on the lens is stale.
-  lastRender = ''
+  lastNames = ''
+  lastText = ''
 }
 
 /** Rebuild the caption page and hand the display back to the transcript. */
@@ -352,16 +429,18 @@ async function showCaptions() {
   // Diagnostic: if this repeats without a gesture, a page-rebuild loop is
   // running and it is what is wiping the menu and the Plex list.
   console.log(`[page] captions (from ${pageMode})`)
-  const ok = await showTranscriptPage(bridge, currentContent)
+  const ok = await showTranscriptPage(bridge, currentText, currentNames)
   if (!ok) {
     setStatus('error', 'rebuildPageContainer failed (transcript)')
     console.error('Failed to rebuild transcript page')
     return
   }
   pageMode = 'transcript'
-  // Force the next render through: the container was just recreated, so
-  // whatever lastRender holds no longer reflects what is on the lens.
-  lastRender = ''
+  // Force the next render through on BOTH columns: the containers were just
+  // recreated, so whatever lastNames/lastText hold no longer reflects what is
+  // on the lens.
+  lastNames = ''
+  lastText = ''
   stt?.dismiss()
   refreshStatus()
 }
@@ -391,8 +470,7 @@ function toggleMic() {
   // and 'Listening…'/'Paused' is one line. Without this the next partial
   // renders against a stale offset and the lens comes back blank.
   resetCaptions()
-  currentContent = micOn ? 'Listening…' : 'Paused'
-  scheduleGlassesRender()
+  setLensMessage(micOn ? 'Listening…' : 'Paused')
   refreshStatus()
 }
 
@@ -421,7 +499,7 @@ function toggleSession() {
   // holds the tail of whatever was said before the recording started.
   stt.clearTranscript()
   resetCaptions()
-  currentContent = 'Listening…'
+  setLensMessage('Listening…')
 
   stt.startSession()
 }

@@ -72,6 +72,37 @@ export interface AssistantState {
 export interface SttHooks {
   /** Recording started/stopped/counted. */
   onSession?: (s: SessionState) => void
+  /**
+   * The in-progress utterance changed.
+   *
+   * Fires for {"type":"partial"} and for the "someone is talking"
+   * placeholder on {"type":"speech", active:true}. Carries NO seq, because
+   * the gateway's partial frame does not have one (gateway.py:3586) - the
+   * partial is always the newest utterance, so it does not need one.
+   */
+  onPartial?: (text: string) => void
+  /**
+   * An utterance finished, with the seq the gateway assigned it.
+   *
+   * This is the SAME utterance the last onPartial described, and the text
+   * can differ from it: Whisper re-decodes the whole buffer with more
+   * context and changes its mind. Treat it as a replacement, not an append.
+   */
+  onUtterance?: (seq: number, text: string) => void
+  /**
+   * Who said utterance `seq`, or null for "scored, but not confidently
+   * anyone".
+   *
+   * ALWAYS ARRIVES AFTER the onUtterance for the same seq, by a few hundred
+   * ms: gateway.py sends the 'final' frame and only then spawns
+   * run_speaker() to embed and score the audio (gateway.py:3486-3496). A
+   * consumer therefore has to be able to fill a name in after the fact.
+   *
+   * Utterances under `speaker_min_ms` return before the embed
+   * (gateway.py:3180-3184) and never produce this frame at all, so short
+   * backchannels stay unnamed permanently. That is correct, not a gap.
+   */
+  onSpeaker?: (seq: number, name: string | null) => void
   /** Summary finished, some seconds after stopSession(). */
   onSummary?: (id: string, text: string) => void
   /**
@@ -322,6 +353,7 @@ export function startSttStream(
           // interim, which is the correct moment for it.
           if (overlay === null && msg.active) {
             onResult({ finalText, interimText: ' ...' })
+            hooks.onPartial?.('…')
           }
           break
 
@@ -336,6 +368,7 @@ export function startSttStream(
           // interim is cleared. Nothing is ever double-counted.
           if (overlay === null) {
             onResult({ finalText, interimText: ` ${msg.text}` })
+            hooks.onPartial?.(msg.text)
           }
           break
 
@@ -345,9 +378,30 @@ export function startSttStream(
             finalText = finalText.slice(-MAX_CHARS)
           }
           console.log(`[stt] +${msg.stt_ms}ms: ${msg.text}`)
-          if (overlay === null) onResult({ finalText, interimText: '' })
+          if (overlay === null) {
+            onResult({ finalText, interimText: '' })
+            hooks.onUtterance?.(msg.seq, msg.text)
+          }
           break
         }
+
+        case 'speaker':
+          // Live speaker identification. The gateway scores the utterance
+          // against the named roster and sends `name` when both
+          // live_roster_match and live_roster_margin clear, or null when
+          // they do not.
+          //
+          // `msg.speaker` (S1/S2/...) is deliberately IGNORED here. It is a
+          // within-session clustering label with no meaning to the person
+          // wearing the glasses, and showing it as a fallback would make an
+          // unidentified voice look identified.
+          //
+          // Not gated on `overlay`: this only annotates an utterance already
+          // in the caption buffer, it never repaints the lens by itself, so
+          // it is safe to apply while an assistant box is up. The annotation
+          // is then already correct when captions come back.
+          hooks.onSpeaker?.(msg.seq, msg.name ?? null)
+          break
 
         case 'wake':
           // Bare wake phrase: gateway is armed and waiting for a question.
