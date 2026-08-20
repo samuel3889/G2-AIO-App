@@ -225,7 +225,7 @@ export interface StatusBridge {
  * worst-case lag on a minute rollover, not a write rate. 15s keeps the BLE
  * render queue seeing about one write per minute.
  */
-const TICK_MS = 15_000
+const TICK_MS = 5_000
 
 /** Push the current time to the lens if it differs from what is up. */
 async function pushClock(bridge: StatusBridge): Promise<void> {
