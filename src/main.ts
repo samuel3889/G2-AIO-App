@@ -7,6 +7,7 @@ import {
 } from '@evenrealities/even_hub_sdk'
 import { startSttStream, type SessionState, type AssistantState } from './asr/stt'
 import { mountUi, setStatus, setTranscript } from './ui'
+import { captionContent, resetCaptions, rulerText, CAPTION_RULER } from './captions'
 import { mountSettings } from './settings'
 import { showPlexPage, showTranscriptPage } from './plex'
 import { assistantBox, OVERLAY_Q_ID, OVERLAY_NAME } from './overlay'
@@ -66,6 +67,13 @@ try {
   console.warn('[status] getDeviceInfo failed:', err)
 }
 
+// What the transcript container holds before anything has been said. Held in
+// a constant because it is needed in two places — the startup container built
+// below, and `currentContent`, which the debounced renderer diffs against.
+// Two literals here would mean the first render after boot was a no-op or a
+// redundant write depending on which one drifted.
+const INITIAL_CONTENT = CAPTION_RULER ? rulerText() : 'Listening…'
+
 const transcript = new TextContainerProperty({
   xPosition: 0,
   // Pushed down by the status strip. Overlapping containers would depend on
@@ -79,7 +87,7 @@ const transcript = new TextContainerProperty({
   paddingLength: 4,
   containerID: 1,
   containerName: 'transcript',
-  content: 'Listening…',
+  content: INITIAL_CONTENT,
   // Exactly one container per page may capture events; the status containers
   // are both 0, so this stays 1.
   isEventCapture: 1,
@@ -108,7 +116,7 @@ const stopStatusUpdates = startStatusUpdates(bridge)
 
 let lastRender = ''
 let renderTimer: number | null = null
-let currentContent = 'Listening…'
+let currentContent = INITIAL_CONTENT
 
 // Which page is on the lens. In 'plex' and 'menu' modes the transcript
 // container does not exist, so textContainerUpgrade would target a
@@ -172,9 +180,20 @@ try {
   stt = startSttStream(
     API_KEY,
     ({ finalText, interimText }) => {
-      const combined = (finalText + interimText).trim()
-      // 240 chars is a rough fit for the 576x288 text container at default font.
-      currentContent = combined ? combined.slice(-240) : 'Listening…'
+      // The lens string is WRAPPED HERE, in captions.ts, rather than handed
+      // to the glasses as one long paragraph for them to wrap themselves.
+      //
+      // The old line was `combined.slice(-240)`. Cutting from the left at an
+      // arbitrary character moved the start of the block on every single
+      // word, so the glasses re-wrapped everything and the text already on
+      // screen slid sideways while you were reading it. It also capped the
+      // display at ~4 lines for no reason other than the 240.
+      //
+      // captionContent() wraps greedily, which is prefix-stable: a word that
+      // is already on a full line cannot move. New words fill the current
+      // line left to right, and a full line scrolls the block up by exactly
+      // one row with every column preserved.
+      currentContent = captionContent(finalText, interimText)
       setTranscript(finalText, interimText)
       scheduleGlassesRender()
     },
@@ -367,6 +386,11 @@ function toggleMic() {
   if (!stt) return
   micOn = !micOn
   bridge.audioControl(micOn)
+  // The caption buffer is not cleared here — pausing should not lose what is
+  // on the lens — but the scroll offset indexes into the wrapped line list,
+  // and 'Listening…'/'Paused' is one line. Without this the next partial
+  // renders against a stale offset and the lens comes back blank.
+  resetCaptions()
   currentContent = micOn ? 'Listening…' : 'Paused'
   scheduleGlassesRender()
   refreshStatus()
@@ -396,6 +420,7 @@ function toggleSession() {
   // stt.dismiss(), which repaints the caption buffer — and that buffer still
   // holds the tail of whatever was said before the recording started.
   stt.clearTranscript()
+  resetCaptions()
   currentContent = 'Listening…'
 
   stt.startSession()
