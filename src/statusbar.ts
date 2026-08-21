@@ -133,8 +133,41 @@ export function setGlassesSn(sn?: string): void {
   glassesSn = sn ?? ''
 }
 
-/** Record a new device status. Does not repaint anything by itself. */
+/**
+ * Record a new device status. Does not repaint anything by itself.
+ *
+ * THE ZERO GUARD. DeviceStatus.fromJson in the shipped index.js reads the
+ * battery with a plain `!= null` fallback to 0:
+ *
+ *   'batteryLevel': (x = json?.batteryLevel) != null ? x : 0
+ *
+ * (the constructor and createDefault() do the same). Note it uses direct
+ * property access, NOT the loose `pickLoose` helper the container classes
+ * use - so a host payload that omits batteryLevel, or spells it differently,
+ * becomes a hard 0 rather than undefined. Since handleGlassesStatusChanged
+ * runs EVERY status event through fromJson, an event that only reports a
+ * wear or connect change arrives here as batteryLevel === 0 and would
+ * otherwise overwrite a perfectly good reading. That is the 0% bug.
+ *
+ * So: a 0 reading is treated as "no reading" whenever we already hold a
+ * non-zero one, and the previous value is kept. The cost is that a genuinely
+ * dead battery freezes at its last real value instead of counting to 0 - an
+ * acceptable trade, since the glasses power off before reporting 0 anyway.
+ * isCharging is carried over with it, because a status event with no battery
+ * field has no meaningful charge flag either.
+ */
 export function setDeviceStatus(s: StatusState): void {
+  const incomingIsZero = s.batteryLevel === 0
+  const haveRealReading =
+    typeof deviceStatus.batteryLevel === 'number' && deviceStatus.batteryLevel > 0
+
+  if (incomingIsZero && haveRealReading) {
+    console.log(
+      `[status] ignoring battery=0 update, keeping ${deviceStatus.batteryLevel}`,
+    )
+    return
+  }
+
   deviceStatus = s
 }
 
@@ -286,9 +319,14 @@ export function startStatusUpdates(bridge: StatusBridge): () => void {
       batteryLevel: status.batteryLevel,
       isCharging: status.isCharging,
     })
+    // connectType / isWearing / isInCase are all declared on DeviceStatus in
+    // index.d.ts. They are logged to identify WHICH events arrive with
+    // battery=0: if the zeros all carry a connect or wear change, that
+    // confirms the fromJson default above rather than a real dead battery.
     console.log(
       `[status] update sn=${status.sn} battery=${status.batteryLevel}` +
-        ` charging=${status.isCharging}`,
+        ` charging=${status.isCharging} connect=${status.connectType}` +
+        ` wearing=${status.isWearing} inCase=${status.isInCase}`,
     )
     void pushBattery(bridge)
   })
