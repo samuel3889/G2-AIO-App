@@ -110,6 +110,24 @@ export interface SttHooks {
    * goes back to captions.
    */
   onAssistant?: (s: AssistantState | null) => void
+  /**
+   * A proactive suggestion for the band, from {"type":"suggest"}.
+   *
+   * `tag` is one of ANSWER / CHECK / ASK / TERM - the gateway validates it
+   * and DROPS anything else before sending (gateway.py:3801), so a frame
+   * that arrives here always carries one of the four and a non-empty text.
+   *
+   * NOT related to onAssistant. This is unsolicited: nobody said a wake
+   * word, nothing is armed, and no follow-up window opens. It must never be
+   * routed through showOverlay() or onResult() - that is the assistant's
+   * path and it feeds the caption buffer, which would put machine text into
+   * the transcript as though a person had said it.
+   *
+   * Only fires when the gateway has SUGGEST_MODE=on. In `shadow` the
+   * suggestion is generated and logged server-side but no frame is sent
+   * (gateway.py:3832).
+   */
+  onSuggest?: (tag: string, text: string) => void
 }
 
 const GATEWAY_URL = import.meta.env.VITE_GATEWAY_URL as string
@@ -401,6 +419,25 @@ export function startSttStream(
           // it is safe to apply while an assistant box is up. The annotation
           // is then already correct when captions come back.
           hooks.onSpeaker?.(msg.seq, msg.name ?? null)
+          break
+
+        case 'suggest':
+          // Unsolicited machine text for the band. Deliberately NOT routed
+          // through onResult() or showOverlay(): those are the assistant's
+          // path, and onResult() feeds the caption buffer - a suggestion
+          // that went that way would be indistinguishable from something a
+          // person in the room actually said.
+          //
+          // NOT gated on `overlay`, unlike the caption frames above. The
+          // band is a container on the caption page, so while an assistant
+          // box is up it is not on screen at all and the write would be a
+          // silent no-op. main.ts holds the text instead and bakes it into
+          // the page when captions come back, so a suggestion that lands
+          // mid-exchange is not simply lost.
+          console.log(
+            `[stt] suggest seq=${msg.seq} ${msg.tag} +${msg.llm_ms}ms: ${msg.text}`,
+          )
+          hooks.onSuggest?.(msg.tag, msg.text)
           break
 
         case 'wake':

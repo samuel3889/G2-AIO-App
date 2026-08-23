@@ -52,6 +52,8 @@
  * It is a full row, not a fraction; CAPTION_LINE_GAP is that switch.
  */
 
+import { STATUS_H, SCREEN_H } from './statusbar'
+
 // --- calibration ------------------------------------------------------------
 
 /**
@@ -121,15 +123,187 @@ export const TEXT_CHARS = Math.floor(
 )
 
 /**
- * How many rows of text physically fit in the transcript container.
+ * Height of one row of text, in px.
  *
- * MEASURED on the lens with the ruler probe, 2026-08-20: 9.
+ * MEASURED, not derived - and the distinction cost a row before it was
+ * noticed. A row count is a FLOOR: "9 rows fit in 248px" only says a row is
+ * at MOST 248/9 = 27.56px, and it is consistent with anything down to
+ * 248/10 = 24.8px. Dividing height by row count therefore anchors on the
+ * CEILING of the possible range, and every figure derived from it
+ * underestimates how many rows fit.
  *
- * The container is 576 x (288 - STATUS_H) = 576 x 256, padding 4, so 248px of
- * usable height. 248 / 9 = ~27.6px per row, which lands almost exactly on
- * overlay.ts's LINE_HEIGHT = 28 — so that guess was close.
+ * Three CAPTION_RULER measurements on the simulator, 2026-08-21, each
+ * bracketing from both sides (N fit, N+1 did not):
+ *
+ *   usable 248px -> 9 rows  ->  24.8  < row <= 27.56
+ *   usable 184px -> 7 rows  ->  23.0  < row <= 26.29
+ *   usable 157px -> 6 rows  ->  22.43 < row <= 26.17
+ *
+ * Intersection: 24.8 < row <= 26.17. 26.0 sits inside it and reproduces all
+ * three counts exactly, and every SUGGEST_ROWS value from 0 to 4 besides.
+ *
+ * ERR HIGH IF YOU RE-MEASURE. Too high only wastes a row to blank space.
+ * Too low makes captionColumns() emit more lines than the container holds,
+ * and the container CLIPS - so the line that disappears is the one at the
+ * bottom, which is the NEWEST thing anyone said.
+ *
+ * NOTE overlay.ts's LINE_HEIGHT = 28 is outside this range and is therefore
+ * also wrong. It only affects the assistant box's own wrapping, so it is not
+ * touched here, but it is worth correcting separately.
  */
-export const CAPTION_ROWS = 9
+const FULL_CONTENT_H = SCREEN_H - STATUS_H
+export const PX_PER_ROW = 26.0
+
+/**
+ * >>> THE ONE NUMBER TO CHANGE <<<  (for the suggestion band)
+ *
+ * How many rows of the lens are given over to the proactive suggester's
+ * band, which sits BELOW the captions and spans the full width.
+ *
+ * The band is a PERMANENT container on the caption page, holding '' when
+ * there is nothing to show. That is deliberate, and it is the whole reason
+ * this is a fixed reservation rather than something that appears and
+ * disappears: a container's geometry is FROZEN at creation
+ * (G2_HANDOFF.md §5), so a band that came and went would need a full
+ * rebuildPageContainer on every appearance AND every expiry, destroying and
+ * recreating both caption columns each time. With a permanent container,
+ * showing and clearing a suggestion is a textContainerUpgrade — the same
+ * cost as an ordinary caption repaint.
+ *
+ * The price is paid once, in caption rows, and it is real:
+ *
+ *   0 -> captions 9 rows, band OFF entirely   (pre-suggest behaviour)
+ *   1 -> captions 8 rows, band ~56 chars        (~9 words)
+ *   2 -> captions 7 rows, band ~112 chars       (~18 words)
+ *   3 -> captions 6 rows, band ~168 chars       (~28 words)
+ *   4 -> captions 5 rows, band ~224 chars       (~37 words)
+ *
+ * All four VERIFIED against CAPTION_RULER, not predicted.
+ *
+ * 3 is the starting value: it is the smallest band that holds
+ * SUGGEST_PROMPT's current 30-word cap without truncating, so it needs no
+ * .env change to try. Dropping to 2 buys a caption row back but requires
+ * cutting that cap to ~18 words, and 1 requires cutting it to ~9, which is
+ * too short for a CHECK to say anything useful.
+ *
+ * A suggestion longer than the band is not lost, it is truncated with an
+ * ellipsis by suggest.ts - but a truncated CHECK is worse than no CHECK,
+ * so treat truncation as a signal to cut the prompt rather than to live
+ * with it.
+ */
+export const SUGGEST_ROWS = 3
+
+/** Height of the suggestion band in px, or 0 when it is switched off. */
+export const SUGGEST_BAND_H =
+  SUGGEST_ROWS > 0
+    ? Math.ceil(SUGGEST_ROWS * PX_PER_ROW + 2 * CAPTION_PADDING)
+    : 0
+
+/**
+ * Height of the caption columns WHEN THE BAND IS UP.
+ *
+ * Also what fixes the band's own top edge, below - so this stays a constant
+ * even though the live height is now a function. The band always has the
+ * same geometry whenever it exists; what varies is whether it exists.
+ */
+const CAPTION_BODY_H_WITH_BAND = FULL_CONTENT_H - SUGGEST_BAND_H
+
+/** Top edge of the band. Immediately below the shortened caption columns. */
+export const SUGGEST_Y = STATUS_H + CAPTION_BODY_H_WITH_BAND
+
+// --- band visibility (RUNTIME) ----------------------------------------------
+
+/**
+ * Whether the suggestion band is currently on the caption page.
+ *
+ * RUNTIME STATE, unlike SUGGEST_ROWS. The band belongs to conversate, and
+ * conversate is a recording session - so outside a session the rows go back
+ * to the captions rather than sitting empty behind a border.
+ *
+ * WHY THIS IS MUTABLE MODULE STATE AND WHAT THAT COSTS
+ *
+ * A container's geometry is FROZEN at creation, so the two caption columns
+ * have a DIFFERENT HEIGHT depending on whether the band is up. That means
+ * changing this flag is only half the job: the page has to be REBUILT for it
+ * to mean anything, and main.ts's lastNames/lastText cache has to be cleared
+ * with it, because the containers those describe no longer exist.
+ *
+ * showCaptions() in main.ts already does both. Nothing else may flip this.
+ *
+ * Starts false: there is no session at boot, so the startup page main.ts
+ * builds is the full-height one.
+ */
+let bandVisible = false
+
+/**
+ * Set band visibility. Returns TRUE if the value actually changed.
+ *
+ * The return value is the point: the caller uses it to decide whether a page
+ * rebuild is needed. Session frames arrive on every utterance while
+ * recording, and rebuilding the page on each one would destroy and recreate
+ * both caption columns several times a minute.
+ *
+ * Forced false when SUGGEST_ROWS is 0, so the compile-time switch still wins
+ * outright and no caller has to check both.
+ */
+export function setBandVisible(visible: boolean): boolean {
+  const next = SUGGEST_ROWS > 0 && visible
+  if (next === bandVisible) return false
+  bandVisible = next
+  return true
+}
+
+/** Whether the band should be built into the page right now. */
+export function isBandVisible(): boolean {
+  return bandVisible
+}
+
+/**
+ * Height of the two caption columns AS OF NOW.
+ *
+ * pages.ts calls THIS for the default height of both transcriptContainer()
+ * and namesContainer(), so the columns and the band cannot disagree about
+ * where one ends and the other begins. A default parameter is evaluated per
+ * call, so each page build picks up the current value.
+ */
+export function captionBodyH(): number {
+  return bandVisible ? CAPTION_BODY_H_WITH_BAND : FULL_CONTENT_H
+}
+
+/**
+ * How many rows of text physically fit in the (now shorter) transcript
+ * container.
+ *
+ * A FUNCTION, not a constant, because the band comes and goes with the
+ * recording session and the columns change height with it. Call it per
+ * render; do not cache the result across a page rebuild.
+ *
+ * DERIVED from captionBodyH() so that SUGGEST_ROWS is the only number that
+ * has to change. It used to be the measured literal 9; keeping it a literal
+ * would mean every band resize was two edits, and forgetting the second one
+ * either wastes a row or writes a row the container silently clips.
+ *
+ * APPROXIMATE — it treats a proportional font's row height as exact. Verify
+ * with CAPTION_RULER after changing SUGGEST_ROWS: the highest row number you
+ * can fully read is the true value, and if it disagrees, MEASURED_FULL_ROWS
+ * above is what needs re-measuring, not this.
+ */
+export function captionRows(): number {
+  return Math.max(
+    1,
+    Math.floor((captionBodyH() - 2 * CAPTION_PADDING) / PX_PER_ROW),
+  )
+}
+
+/**
+ * Characters that fit on one line of the FULL-WIDTH suggestion band.
+ *
+ * The band is not offset by the name column — a suggestion has no speaker —
+ * so it gets the full 56, not TEXT_CHARS.
+ */
+export const SUGGEST_CHARS = Math.floor(
+  (SCREEN_W - 2 * CAPTION_PADDING) / PX_PER_CHAR,
+)
 
 /**
  * Blank rows inserted between text lines.
@@ -167,7 +341,7 @@ const UNKNOWN_NAME = '?'
  * anything that changes STATUS_H, the container height, or the firmware's
  * font invalidates them and this is how they get re-measured.
  *
- *   - Highest row number you can fully read      -> CAPTION_ROWS
+ *   - Highest row number you can fully read      -> captionRows()
  *   - Does any row wrap onto a second line?      -> CAPTION_CHARS_PER_LINE
  *                                                   is too high
  *   - Empty gutter right of the '>' markers?     -> too low
@@ -302,7 +476,10 @@ export function setName(seq: number, name: string | null): void {
 
 /** Text lines that fit on screen, once the blank spacer rows are paid for. */
 export function visibleLines(): number {
-  return Math.max(1, Math.floor((CAPTION_ROWS + CAPTION_LINE_GAP) / (1 + CAPTION_LINE_GAP)))
+  return Math.max(
+    1,
+    Math.floor((captionRows() + CAPTION_LINE_GAP) / (1 + CAPTION_LINE_GAP)),
+  )
 }
 
 /**

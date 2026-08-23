@@ -14,10 +14,20 @@ import {
   setName,
   rulerText,
   CAPTION_RULER,
+  setBandVisible,
+  isBandVisible,
 } from './captions'
-import { NAMES_ID, NAMES_NAME, namesContainer } from './plex'
+import { NAMES_ID, NAMES_NAME, namesContainer } from './pages'
 import { mountSettings } from './settings'
-import { showPlexPage, showTranscriptPage, transcriptContainer } from './plex'
+import { showTranscriptPage, transcriptContainer } from './pages'
+import { showPlexPage } from './plex'
+import {
+  suggestContainers,
+  formatSuggest,
+  SUGGEST_ID,
+  SUGGEST_NAME,
+  SUGGEST_HOLD_MS,
+} from './suggest'
 import { assistantBox, OVERLAY_Q_ID, OVERLAY_NAME } from './overlay'
 import { RebuildPageContainer } from '@evenrealities/even_hub_sdk'
 import { showMenuPage, MENU_ACTIONS, menuLabels, type MenuAction } from './menu'
@@ -81,17 +91,27 @@ try {
 // redundant write depending on which one drifted.
 const INITIAL_CONTENT = CAPTION_RULER ? rulerText() : 'Listening…'
 
-// GEOMETRY LIVES IN plex.ts. This used to be an inline TextContainerProperty
-// spanning the full 576, duplicating transcriptContainer()'s layout. Now that
-// the caption page is TWO columns, a second copy of the geometry would drift
-// from the one showTranscriptPage() builds and the columns would stop lining
-// up after the first rebuild.
+// GEOMETRY LIVES IN pages.ts. This used to be an inline
+// TextContainerProperty spanning the full 576, duplicating
+// transcriptContainer()'s layout. Now that the caption page is TWO columns, a
+// second copy of the geometry would drift from the one showTranscriptPage()
+// builds and the columns would stop lining up after the first rebuild.
 const transcript = transcriptContainer(INITIAL_CONTENT, 1)
 
-// FOUR containers at startup, not three. zOrderIndex is ALL-OR-NOTHING per
-// page and unique across all of them: transcript 0, names 1, clock 10,
-// battery 11.
-const startupText = [transcript, namesContainer(''), ...statusContainers()]
+// FOUR containers at startup: transcript 0, names 1, clock 10, battery 11.
+// zOrderIndex is ALL-OR-NOTHING per page and unique across all of them.
+//
+// suggestContainers() is spread here for the same reason showTranscriptPage()
+// does it, but at boot it returns EMPTY - no session is recording, so the
+// band is not up and the captions get the full nine rows. It is spread
+// rather than omitted so that this page and the rebuilt one are built the
+// same way and cannot drift.
+const startupText = [
+  transcript,
+  namesContainer(''),
+  ...suggestContainers(),
+  ...statusContainers(),
+]
 
 const created = await bridge.createStartUpPageContainer(
   new CreateStartUpPageContainer({
@@ -117,6 +137,41 @@ const stopStatusUpdates = startStatusUpdates(bridge)
 // enough to need the 120ms debounce below.
 let lastNames = ''
 let lastText = ''
+
+/**
+ * The suggestion currently on the lens, already formatted by
+ * formatSuggest(), or '' for none.
+ *
+ * Held here rather than written straight to the container because
+ * showTranscriptPage() BAKES IT INTO the rebuild. The caption page is rebuilt
+ * on every return from the menu, a Plex list or an assistant box, and a
+ * suggestion still inside its hold window has to survive that round trip -
+ * a rebuild that dropped it would blank the band mid-countdown.
+ */
+let currentSuggestion = ''
+
+/** What the band container actually holds, so a repeat write is skipped. */
+let lastSuggestion = ''
+
+/** Clears currentSuggestion when it lapses. Null when nothing is up. */
+let suggestTimer: number | null = null
+
+/**
+ * Whether the page CURRENTLY ON THE LENS was built with the band.
+ *
+ * Not the same thing as isBandVisible(), and the gap between them is the
+ * whole point. isBandVisible() is what the band SHOULD be; this is what was
+ * actually built. They diverge whenever the flag changes while a rebuild is
+ * already in flight, which is the normal case at session start:
+ * runMenuSelection() calls toggleSession() and then showCaptions()
+ * immediately, but startSession() only SENDS the command - the gateway's
+ * 'session' frame confirming it lands during that rebuild.
+ *
+ * Comparing against this instead of watching for the flag to change means a
+ * late-arriving frame still gets the page corrected, rather than being
+ * dropped because the rebuild it needed had already started.
+ */
+let bandOnPage = false
 let renderTimer: number | null = null
 let currentNames = ''
 let currentText = INITIAL_CONTENT
@@ -198,6 +253,72 @@ function scheduleGlassesRender() {
   }, 120) // debounce display writes — BLE render queue is slow
 }
 
+/**
+ * Push currentSuggestion into the band container.
+ *
+ * Written DIRECTLY rather than through scheduleGlassesRender()'s 120ms
+ * debounce. That debounce exists because partials arrive several times a
+ * second; suggestions arrive at most once every few seconds and are already
+ * rate-limited server-side, so there is nothing to coalesce.
+ *
+ * Skipped entirely unless the caption page is on screen AND the band is up,
+ * because textContainerUpgrade against a container that is not on the
+ * current page does nothing and reports nothing. currentSuggestion still
+ * holds the text, and showCaptions() bakes it into the next rebuild - which
+ * is what makes a suggestion survive a trip through the menu.
+ */
+async function pushSuggestion() {
+  if (pageMode !== 'transcript') return
+  if (assistant !== null) return
+  if (!isBandVisible()) return
+  if (currentSuggestion === lastSuggestion) return
+  lastSuggestion = currentSuggestion
+  const ok = await bridge.textContainerUpgrade(
+    new TextContainerUpgrade({
+      containerID: SUGGEST_ID,
+      containerName: SUGGEST_NAME,
+      content: currentSuggestion,
+    }),
+  )
+  // Only trust the cache if the write was accepted - on false the string is
+  // NOT on the lens and the next attempt should try again rather than skip.
+  if (!ok) {
+    lastSuggestion = ''
+    console.warn('[suggest] upgrade returned false')
+  }
+}
+
+/**
+ * Drop whatever is in the band and stop its clock.
+ *
+ * Called on expiry, and on session end - the band leaves the page with the
+ * session, so a suggestion left in currentSuggestion would reappear on the
+ * next session's first rebuild, hours later and with no relation to what was
+ * being said.
+ */
+function clearSuggestion() {
+  if (suggestTimer !== null) {
+    window.clearTimeout(suggestTimer)
+    suggestTimer = null
+  }
+  currentSuggestion = ''
+  void pushSuggestion()
+}
+
+/**
+ * Recompute both caption columns WITHOUT queueing a render.
+ *
+ * Used before a page rebuild, where showTranscriptPage() bakes currentText
+ * straight in. The row count changes with the band, so the columns have to
+ * be recut for the new height first or the rebuild paints the wrong number
+ * of lines.
+ */
+function syncCaptionColumns() {
+  const cols = captionColumns()
+  currentNames = cols.names
+  currentText = cols.text
+}
+
 /** Pull both columns out of the caption buffer and queue a render. */
 function repaintCaptions() {
   const cols = captionColumns()
@@ -228,8 +349,32 @@ function hint(): string {
   return `${rec}${mic} · tap to ${micOn ? 'pause' : 'resume'} · double-tap for menu`
 }
 
+/**
+ * TEMPORARY BAND DIAGNOSTIC - the last few band decisions, newest last.
+ *
+ * On the PHONE STATUS LINE rather than the console, for the same reason
+ * renderAssistant()'s DBG line is: console.log lives in the WebView and is
+ * unreadable while the glasses are actually being worn. This needs no
+ * tooling - read it off the phone screen.
+ *
+ * Delete this, noteBand() and its call sites once the band reliably appears
+ * at session start.
+ */
+const bandLog: string[] = []
+
+function noteBand(where: string) {
+  bandLog.push(
+    `${where} want=${isBandVisible() ? 1 : 0} page=${bandOnPage ? 1 : 0} mode=${pageMode}`,
+  )
+  // Only the last three matter: the session frame, the rebuild it raced, and
+  // the corrective pass. Older entries would push the useful ones off the
+  // end of the status line.
+  if (bandLog.length > 3) bandLog.shift()
+}
+
 function refreshStatus() {
-  setStatus(sessionActive || micOn ? 'listening' : 'paused', hint())
+  const kind = sessionActive || micOn ? 'listening' : 'paused'
+  setStatus(kind, bandLog.length ? `${hint()} · ${bandLog.join(' | ')}` : hint())
 }
 
 // The default stt.ts is a blank stub that throws. Catch the throw so the UI
@@ -296,6 +441,48 @@ try {
         sessionUtterances = s.utterances
         setLiveSession(s)
 
+        // The suggestion band belongs to the recording session, so it comes
+        // and goes with it rather than sitting empty behind a border.
+        //
+        // setBandVisible() returns whether the value CHANGED, and that guard
+        // is load-bearing: this hook fires on every utterance while
+        // recording, and the band can only appear or disappear through a
+        // full page rebuild - the columns are a different height with it up,
+        // and container geometry is frozen at creation. Rebuilding on every
+        // increment would tear down and recreate both caption columns
+        // several times a minute.
+        //
+        // Only rebuild if the caption page is the thing on screen. From the
+        // menu, a Plex list or an assistant box, a rebuild here would yank
+        // the display out from under the user - and it is not needed, since
+        // showCaptions() reads the flag when it next builds the page anyway.
+        // The band leaves the page when the session stops, so anything in
+        // it goes too - otherwise it would reappear on the first rebuild of
+        // the NEXT session, unrelated to anything being said then.
+        if (!s.active) clearSuggestion()
+
+        setBandVisible(s.active)
+
+        // Compare against what was BUILT, not against the previous flag
+        // value. This hook fires on every utterance while recording, so the
+        // comparison still collapses to a no-op almost every time - but when
+        // the page and the flag genuinely disagree it corrects them, even if
+        // the frame that changed the flag arrived while showCaptions() was
+        // mid-rebuild. Watching for the flag to CHANGE missed exactly that
+        // case, and the band never appeared until the next manual return to
+        // captions.
+        //
+        // Still skipped unless captions are the thing on screen: from the
+        // menu, a Plex list or an assistant box a rebuild would yank the
+        // display out from under the user, and showCaptions() reads the flag
+        // when it next builds the page anyway.
+        noteBand(`sess${s.active ? 1 : 0}`)
+
+        if (isBandVisible() !== bandOnPage && pageMode === 'transcript' && assistant === null) {
+          syncCaptionColumns()
+          void showCaptions()
+        }
+
         // A stop with no summary coming (LLM unconfigured, or nothing
         // recorded) never produces a 'summary' frame, so the session list
         // has to be refreshed here or the new entry never appears.
@@ -306,6 +493,20 @@ try {
         // selection, which would yank the highlight out from under a user
         // mid-scroll. The count refreshes when the menu is next opened.
         refreshStatus()
+      },
+      onSuggest: (tag: string, text: string) => {
+        // A newer suggestion REPLACES an older one and restarts the clock
+        // rather than queueing behind it: two inside the hold window means
+        // the second is the more relevant one, and the conversation has
+        // already moved past the first.
+        currentSuggestion = formatSuggest(tag, text)
+        if (suggestTimer !== null) window.clearTimeout(suggestTimer)
+        suggestTimer = window.setTimeout(() => {
+          suggestTimer = null
+          currentSuggestion = ''
+          void pushSuggestion()
+        }, SUGGEST_HOLD_MS)
+        void pushSuggestion()
       },
       onSummary: (id, _text) => {
         console.log(`[app] summary ready for ${id}`)
@@ -429,7 +630,20 @@ async function showCaptions() {
   // Diagnostic: if this repeats without a gesture, a page-rebuild loop is
   // running and it is what is wiping the menu and the Plex list.
   console.log(`[page] captions (from ${pageMode})`)
-  const ok = await showTranscriptPage(bridge, currentText, currentNames)
+  // Read the flag BEFORE the await, because that is when the page is built
+  // from it: showTranscriptPage() spreads suggestContainers() synchronously
+  // on entry, then awaits rebuildPageContainer. Reading it afterwards records
+  // the flag as it is when the rebuild FINISHES, which is a different moment
+  // - and if a 'session' frame landed in between, the record would claim the
+  // page has a band it was never built with, hiding the disagreement the
+  // check below exists to catch.
+  const builtWithBand = isBandVisible()
+  const ok = await showTranscriptPage(
+    bridge,
+    currentText,
+    currentNames,
+    currentSuggestion,
+  )
   if (!ok) {
     setStatus('error', 'rebuildPageContainer failed (transcript)')
     console.error('Failed to rebuild transcript page')
@@ -441,8 +655,31 @@ async function showCaptions() {
   // on the lens.
   lastNames = ''
   lastText = ''
+  // The band was rebuilt WITH currentSuggestion baked in, so that is what is
+  // on the lens - recording it here stops pushSuggestion() writing the same
+  // string again on the next frame.
+  lastSuggestion = currentSuggestion
+  // What this page was ACTUALLY built with, captured above.
+  bandOnPage = builtWithBand
   stt?.dismiss()
+  noteBand('built')
   refreshStatus()
+
+  // The session state may have changed while that rebuild was in flight, in
+  // which case the page just built is already stale. This is the NORMAL path
+  // at session start, not an edge case: runMenuSelection() calls
+  // toggleSession() and then showCaptions() immediately, and startSession()
+  // only SENDS the command - the gateway's confirming 'session' frame
+  // arrives during this rebuild, too late for the page and too early for the
+  // onSession handler to act on (pageMode was still 'menu').
+  //
+  // One corrective pass. It cannot loop: the second call captures the flag
+  // as it now is, and only another session frame could move it again.
+  if (isBandVisible() !== bandOnPage) {
+    noteBand('fix')
+    syncCaptionColumns()
+    await showCaptions()
+  }
 }
 
 /** Rebuild the menu page. Reads current state for its labels and header. */
@@ -576,6 +813,12 @@ function cleanup() {
   bridge.audioControl(false)
   stt?.close()
   stopStatusUpdates()
+  // The hold timer would otherwise outlive the widget and fire a
+  // textContainerUpgrade against a torn-down bridge.
+  if (suggestTimer !== null) {
+    window.clearTimeout(suggestTimer)
+    suggestTimer = null
+  }
   unsubscribe()
 }
 
