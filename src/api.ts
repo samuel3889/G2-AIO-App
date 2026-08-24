@@ -1,16 +1,14 @@
 /**
  * One place for the gateway URL rule and the token.
  *
- * settings.ts and sessions.ts each carry their own verbatim copy of
- * restBase(). A third copy in review.ts would be a third thing to keep in
- * sync, so the rule lives here instead. The two existing files are
- * deliberately NOT changed yet — migrating them is a separate, independently
- * verifiable step:
+ * settings.ts, sessions.ts, prompts.ts and review.ts all consume restBase()
+ * and restUrl() from here. There is no second copy of the rule anywhere in
+ * the app; if you find one, delete it rather than keeping the two in sync.
  *
- *     import { restBase } from './api'      // then delete the local copy
- *
- * The rule itself is copied byte-for-byte from settings.ts, so behaviour is
- * identical today.
+ * NOTE this module deliberately does NOT own the WebSocket URL. stt.ts reads
+ * VITE_GATEWAY_URL directly because it needs the wss:// form verbatim,
+ * whereas everything here needs it rewritten to https:// with the /ws/stt
+ * path stripped. One export cannot be both.
  */
 
 const GATEWAY_URL = import.meta.env.VITE_GATEWAY_URL as string
@@ -26,7 +24,7 @@ export function restBase(): string {
  * Absolute gateway URL with the token appended.
  *
  * Uses `&` when the path already carries a query string, which is what makes
- * `restUrl('/sessions/x/review?all=1')` work. Same rule as sessions.ts.
+ * `restUrl('/sessions/x/review?all=1')` work.
  */
 export function restUrl(path: string): string {
   const sep = path.includes('?') ? '&' : '?'

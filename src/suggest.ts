@@ -121,29 +121,6 @@ const BAND_BORDER_WIDTH = 1
 const BAND_BORDER_COLOR = 12
 
 /**
- * TEMPORARY DEBUG PROBE — leave as a string for ONE run to confirm the band
- * renders at all, then set to null.
- *
- * While this is a string the band shows THAT and ignores every suggestion.
- * This is the first container in this app created at a non-zero yPosition on
- * the caption page, and a container that rebuildPageContainer accepts but
- * that never displays text is a failure mode this codebase has already hit
- * once (see overlay.ts's three probes).
- *
- * Reading the result:
- *   text visible          -> geometry, ID, z-order and border are all fine.
- *                            Set to null and wire the frame.
- *   band drawn but empty  -> the container is on the page but will not take
- *                            content. Same signature as the old overlay bug.
- *   nothing at all, and
- *   captions still fill
- *   the whole screen      -> rebuildPageContainer returned false. Look for
- *                            [EvenHub:DUPLICATE_Z_ORDER_INDEX] on the
- *                            console.
- */
-const DEBUG_BAND_TEXT: string | null = null
-
-/**
  * What goes in front of the suggestion text.
  *
  * The gateway's tag (ANSWER / CHECK / ASK / TERM) is deliberately NOT shown
@@ -253,7 +230,6 @@ export function formatSuggest(_tag: string, text: string): string {
  * that pauses the microphone.
  */
 export function suggestContainer(content: string): TextContainerProperty {
-  const shown = DEBUG_BAND_TEXT ?? content
   return new TextContainerProperty({
     // Full width. A suggestion has no speaker, so it is not offset by the
     // name column the way the transcript is.
@@ -281,13 +257,13 @@ export function suggestContainer(content: string): TextContainerProperty {
     // when a suggestion appears and one when it lapses, and it is why the
     // gateway's cooldown matters: at the default 45s cooldown this is two
     // rebuilds a minute at most, not two per utterance.
-    borderWidth: shown ? BAND_BORDER_WIDTH : 0,
+    borderWidth: content ? BAND_BORDER_WIDTH : 0,
     borderColor: BAND_BORDER_COLOR,
     borderRadius: 0,
     paddingLength: CAPTION_PADDING,
     containerID: SUGGEST_ID,
     containerName: SUGGEST_NAME,
-    content: shown,
+    content,
     isEventCapture: 0,
     zOrderIndex: SUGGEST_Z,
   })

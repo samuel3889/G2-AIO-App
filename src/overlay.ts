@@ -164,78 +164,6 @@ export const CHARS_PER_LINE = 54
  */
 export const LINE_HEIGHT = 28
 
-/**
-* TEMPORARY DEBUG PROBE — leave as 'TEST' for ONE run to confirm the
- * content fix, then set to null.
- *
- * When this is a string, the box renders THAT and nothing else: seven ASCII
- * characters, one line, no newlines, no curly quotes, no ellipsis. The real
- * content has all four of those, and the Plex header and menu labels — which
- * DO render — have none of them.
- *
- * Reading the result:
- *   TEST visible  -> the container, geometry, ID and border are all fine, and
- *                    something in the CONTENT string is what blanks the box.
- *   still blank   -> the content is irrelevant; the container itself is not
- *                    rendering, and geometry/ID/border is where to look next.
- */
-const DEBUG_BOX_TEXT: string | null = null
-
-/**
- * TEMPORARY DEBUG PROBE 2.
- *
- * When true, the box is drawn with the SAME geometry the transcript
- * container uses — origin 0,0, full 576 width, no border, no radius,
- * padding 4 — and only its height follows the content. The only thing that
- * still differs from the caption page is the container ID and name.
- *
- * The pattern this is testing: every container in this app that renders
- * text (transcript, Plex header, menu header) sits at x=0, y=0 and spans
- * the full width. The assistant box is the only one that does not, and it
- * is the only one whose text never appears — while its BORDER draws in the
- * right place. That is what a text run positioned at the page origin and
- * then clipped to the container rectangle would look like.
- *
- *   TEST appears -> position/border is the culprit; add one property back
- *                   at a time (x offset, then y offset, then border) until
- *                   it disappears again.
- *   still blank  -> geometry is not it either, and the next variable is the
- *                   container ID: reuse 1/'transcript' and see if the same
- *                   box renders under the identity the OS already knows.
- */
-const DEBUG_PLAIN_GEOMETRY = false
-
-/**
- * TEMPORARY DEBUG PROBE 3.
- *
- * When true, the box is built as containerID 1 / 'transcript' — the exact
- * identity created by createStartUpPageContainer at boot, and the only
- * container in this app that has ever been written to successfully by
- * textContainerUpgrade.
- *
- * What is left to explain: with probe 2 the box had the transcript's
- * geometry and still rendered no text, so position, width, border and
- * padding are all cleared. The remaining differences between it and a
- * container that works are its ID/name, and the fact that the overlay page
- * carries a single container while the Plex and menu pages carry two.
- * This tests the first of those.
- *
- *   TEST appears -> a text container invented by rebuildPageContainer cannot
- *                   be written to; the overlay must reuse ID 1, and the
- *                   whole OVERLAY_Q_ID idea goes away.
- *   still blank  -> ID is not it either, and the last variable is the
- *                   single-container page: next probe adds a second, dummy
- *                   container so the overlay page has the same shape as the
- *                   Plex and menu pages that do render.
- */
-const DEBUG_TRANSCRIPT_IDENTITY = false
-
-// Kept in sync with plex.ts's TRANSCRIPT_ID / TRANSCRIPT_NAME by hand: this
-// is probe scaffolding, not permanent, and importing plex.ts here just to
-// read two constants would couple the layout module to the page module.
-const PROBE_ID = 1
-const PROBE_NAME = 'transcript'
-
 /** Border colour 0-16. One border now, for the whole exchange. */
 const BOX_BORDER_COLOR = 12
 
@@ -317,7 +245,7 @@ export function assistantBox(s: AssistantState): TextContainerProperty[] {
 
   // A blank line between the two so the reply is visually separate from the
   // question without a second border to separate it.
-  const body = DEBUG_BOX_TEXT ?? (aText ? `${qText}\n\n${aText}` : qText)
+  const body = aText ? `${qText}\n\n${aText}` : qText
 
   // Clamp: trim until the box fits above the bottom margin.
   const avail = MAX_BOX_BOTTOM - BOX_TOP
@@ -332,24 +260,20 @@ export function assistantBox(s: AssistantState): TextContainerProperty[] {
 
   return [
     new TextContainerProperty({
-      xPosition: DEBUG_PLAIN_GEOMETRY ? 0 : BOX_MARGIN_X,
-      yPosition: DEBUG_PLAIN_GEOMETRY ? 0 : BOX_TOP,
-      width: DEBUG_PLAIN_GEOMETRY ? SCREEN_W : BOX_W,
-      height: DEBUG_PLAIN_GEOMETRY ? 288 : Math.min(boxHeight(shown), avail),
-      // Back to 2 for this round. Text is absent with the border at 0 AND at
-      // 2, so the border is not the variable any more — but a visible frame
-      // is how you confirm the page is up while reading the diagnostics on
-      // the phone.
+      xPosition: BOX_MARGIN_X,
+      yPosition: BOX_TOP,
+      width: BOX_W,
+      height: Math.min(boxHeight(shown), avail),
       borderWidth: 2,
-      borderColor: DEBUG_PLAIN_GEOMETRY ? 5 : BOX_BORDER_COLOR,
-      borderRadius: DEBUG_PLAIN_GEOMETRY ? 0 : 4,
-      paddingLength: DEBUG_PLAIN_GEOMETRY ? 4 : BOX_PADDING,
-      containerID: DEBUG_TRANSCRIPT_IDENTITY ? PROBE_ID : OVERLAY_Q_ID,
-      containerName: DEBUG_TRANSCRIPT_IDENTITY ? PROBE_NAME : OVERLAY_NAME,
-      // THE BUG: `shown` was computed above and then never passed. The
-      // container went to the lens with no `content` at all, so the box
-      // drew and stayed empty — and main.ts reads `boxes[0].content` to
-      // build its textContainerUpgrade, so the upgrade sent '' too.
+      borderColor: BOX_BORDER_COLOR,
+      borderRadius: 4,
+      paddingLength: BOX_PADDING,
+      containerID: OVERLAY_Q_ID,
+      containerName: OVERLAY_NAME,
+      // `content` must be passed here even though main.ts follows the
+      // rebuild with a textContainerUpgrade: that upgrade reads
+      // `boxes[0].content`, so a container built without it sends '' too
+      // and the box draws empty.
       content: shown,
       // Only container on the overlay page, so depth 0 of 1.
       zOrderIndex: zFor(0, 1),

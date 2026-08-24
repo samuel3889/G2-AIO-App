@@ -1,6 +1,7 @@
 import {
   waitForEvenAppBridge,
   CreateStartUpPageContainer,
+  RebuildPageContainer,
   TextContainerUpgrade,
   OsEventTypeList,
 } from '@evenrealities/even_hub_sdk'
@@ -12,14 +13,19 @@ import {
   setPartial,
   pushFinal,
   setName,
-  rulerText,
-  CAPTION_RULER,
   setBandVisible,
   isBandVisible,
 } from './captions'
-import { NAMES_ID, NAMES_NAME, namesContainer } from './pages'
+import {
+  NAMES_ID,
+  NAMES_NAME,
+  TRANSCRIPT_ID,
+  TRANSCRIPT_NAME,
+  namesContainer,
+  showTranscriptPage,
+  transcriptContainer,
+} from './pages'
 import { mountSettings } from './settings'
-import { showTranscriptPage, transcriptContainer } from './pages'
 import { showPlexPage } from './plex'
 import {
   suggestContainers,
@@ -29,7 +35,6 @@ import {
   resolveHoldMs,
 } from './suggest'
 import { assistantBox, OVERLAY_Q_ID, OVERLAY_NAME } from './overlay'
-import { RebuildPageContainer } from '@evenrealities/even_hub_sdk'
 import { showMenuPage, MENU_ACTIONS, menuLabels, type MenuAction } from './menu'
 import { mountSessions, setLiveSession, refreshSessions } from './sessions'
 import { mountTabs } from './tabs'
@@ -90,7 +95,12 @@ try {
 // below, and `currentText`, which the debounced renderer diffs against. Two
 // literals here would mean the first render after boot was a no-op or a
 // redundant write depending on which one drifted.
-const INITIAL_CONTENT = CAPTION_RULER ? rulerText() : 'Listening…'
+//
+// captions.ts's CAPTION_RULER probe is deliberately NOT consulted here. It is
+// read inside captionColumns(), so turning it on still replaces the captions
+// the moment anything repaints — this constant only covers the gap before the
+// first render.
+const INITIAL_CONTENT = 'Listening…'
 
 // GEOMETRY LIVES IN pages.ts. This used to be an inline
 // TextContainerProperty spanning the full 576, duplicating
@@ -217,26 +227,6 @@ let micOn = false
 // does not exist.
 let assistant: AssistantState | null = null
 
-// REBUILD THE CAPTION PAGE ONCE AT BOOT.
-//
-// createStartUpPageContainer above is the ONLY thing that ran at launch, and
-// a container's xPosition and width are frozen when it is created -
-// textContainerUpgrade replaces content and nothing else. So every page the
-// startup call put up kept whatever geometry was compiled in at that moment,
-// and the first rebuild only happened by accident, on the way back from a
-// Plex list or an assistant answer.
-//
-// That is what made changing NAMES_W appear to do nothing while the WRAP
-// (recomputed on the phone every render) changed immediately, and what left
-// the names column invisible until a round trip through another page.
-//
-// Doing it here means showCaptions() is the single function that ever builds
-// this page. The startup call still runs because the SDK expects a page to
-// exist before rebuildPageContainer is valid; it is now just a placeholder
-// that gets replaced immediately. One redundant rebuild at launch is a
-// cheaper price than two copies of the geometry that drift apart.
-// await showCaptions()
-
 function scheduleGlassesRender() {
   if (pageMode !== 'transcript') return
   if (assistant !== null) return
@@ -265,8 +255,8 @@ function scheduleGlassesRender() {
       lastText = currentText
       await bridge.textContainerUpgrade(
         new TextContainerUpgrade({
-          containerID: 1,
-          containerName: 'transcript',
+          containerID: TRANSCRIPT_ID,
+          containerName: TRANSCRIPT_NAME,
           content: currentText,
         }),
       )
@@ -340,17 +330,7 @@ async function pushSuggestion() {
  * session, so a suggestion left in currentSuggestion would reappear on the
  * next session's first rebuild, hours later and with no relation to what was
  * being said.
- */
-function clearSuggestion(push = true) {
-  if (suggestTimer !== null) {
-    window.clearTimeout(suggestTimer)
-    suggestTimer = null
-  }
-  currentSuggestion = ''
-  if (push) void pushSuggestion()
-}
-
-/**
+ *
  * WHY `push` IS A PARAMETER
  *
  * On expiry, pushing is the whole point: the band is staying on the page and
@@ -365,27 +345,32 @@ function clearSuggestion(push = true) {
  * The state is still cleared either way, which is what stops a suggestion
  * from the last session reappearing on the first rebuild of the next one.
  */
-
-/**
- * Recompute both caption columns WITHOUT queueing a render.
- *
- * Used before a page rebuild, where showTranscriptPage() bakes currentText
- * straight in. The row count changes with the band, so the columns have to
- * be recut for the new height first or the rebuild paints the wrong number
- * of lines.
- */
-function syncCaptionColumns() {
-  const cols = captionColumns()
-  currentNames = cols.names
-  currentText = cols.text
+function clearSuggestion(push = true) {
+  if (suggestTimer !== null) {
+    window.clearTimeout(suggestTimer)
+    suggestTimer = null
+  }
+  currentSuggestion = ''
+  if (push) void pushSuggestion()
 }
 
-/** Pull both columns out of the caption buffer and queue a render. */
-function repaintCaptions() {
+/**
+ * Recompute both caption columns from the buffer.
+ *
+ * `render` is false before a PAGE REBUILD, where showTranscriptPage() bakes
+ * currentText straight into the new containers - queueing a debounced write
+ * as well would just fire it against containers that no longer exist. The
+ * row count changes with the band, so the columns still have to be recut for
+ * the new height first, or the rebuild paints the wrong number of lines.
+ *
+ * `render` is true on the ordinary caption path, where the containers are
+ * already on the page and the debounced writer is how text reaches them.
+ */
+function syncCaptionColumns(render = false) {
   const cols = captionColumns()
   currentNames = cols.names
   currentText = cols.text
-  scheduleGlassesRender()
+  if (render) scheduleGlassesRender()
 }
 
 /**
@@ -410,32 +395,9 @@ function hint(): string {
   return `${rec}${mic} · tap to ${micOn ? 'pause' : 'resume'} · double-tap for menu`
 }
 
-/**
- * TEMPORARY BAND DIAGNOSTIC - the last few band decisions, newest last.
- *
- * On the PHONE STATUS LINE rather than the console, for the same reason
- * renderAssistant()'s DBG line is: console.log lives in the WebView and is
- * unreadable while the glasses are actually being worn. This needs no
- * tooling - read it off the phone screen.
- *
- * Delete this, noteBand() and its call sites once the band reliably appears
- * at session start.
- */
-const bandLog: string[] = []
-
-function noteBand(where: string) {
-  bandLog.push(
-    `${where} want=${isBandVisible() ? 1 : 0} page=${bandOnPage ? 1 : 0} mode=${pageMode}`,
-  )
-  // Only the last three matter: the session frame, the rebuild it raced, and
-  // the corrective pass. Older entries would push the useful ones off the
-  // end of the status line.
-  if (bandLog.length > 3) bandLog.shift()
-}
-
 function refreshStatus() {
   const kind = sessionActive || micOn ? 'listening' : 'paused'
-  setStatus(kind, bandLog.length ? `${hint()} · ${bandLog.join(' | ')}` : hint())
+  setStatus(kind, hint())
 }
 
 // The default stt.ts is a blank stub that throws. Catch the throw so the UI
@@ -483,18 +445,18 @@ try {
       // seq so the name can be filled in when it lands.
       onPartial: (text: string) => {
         setPartial(text)
-        repaintCaptions()
+        syncCaptionColumns(true)
       },
       onUtterance: (seq: number, text: string) => {
         pushFinal(seq, text)
-        repaintCaptions()
+        syncCaptionColumns(true)
       },
       onSpeaker: (seq: number, name: string | null) => {
         setName(seq, name)
         // The name lives in its OWN container, so writing it in cannot
         // change the wrap or the row count of the text beside it. This
         // repaint swaps '?' for 'Samuel' and moves nothing else.
-        repaintCaptions()
+        syncCaptionColumns(true)
       },
 
       onSession: (s: SessionState) => {
@@ -540,8 +502,6 @@ try {
         // menu, a Plex list or an assistant box a rebuild would yank the
         // display out from under the user, and showCaptions() reads the flag
         // when it next builds the page anyway.
-        noteBand(`sess${s.active ? 1 : 0}`)
-
         if (isBandVisible() !== bandOnPage && pageMode === 'transcript' && assistant === null) {
           syncCaptionColumns()
           void showCaptions()
@@ -660,14 +620,16 @@ async function renderAssistant(s: AssistantState) {
   )
 
   // Paint the text INTO the container the rebuild just made.
-  let up: boolean | string = 'skipped'
+  //
+  // The ID and name are read off the container that was just built rather
+  // than from the OVERLAY_* constants. Those agree today, but an upgrade
+  // aimed at a container that is not on the page does nothing at all and
+  // reports nothing, so reading from the built object keeps the two in step
+  // by construction.
+  let upgraded = false
   if (ok) {
-    up = await bridge.textContainerUpgrade(
+    upgraded = await bridge.textContainerUpgrade(
       new TextContainerUpgrade({
-        // Read off the container that was just built, rather than from the
-        // constants: the probes in overlay.ts can change the ID or name, and
-        // an upgrade aimed at a container that is not on the page does
-        // nothing at all — silently.
         containerID: boxes[0]?.containerID ?? OVERLAY_Q_ID,
         containerName: boxes[0]?.containerName ?? OVERLAY_NAME,
         content: body,
@@ -675,18 +637,7 @@ async function renderAssistant(s: AssistantState) {
     )
   }
 
-  // DIAGNOSTIC — the two return values we have never actually seen.
-  //
-  // Both of these calls return a boolean, and every conclusion in this
-  // debugging session has ASSUMED both were true. This reports them to the
-  // PHONE status line rather than the console, because that needs no tooling:
-  // read it off the phone screen while the box is on the lens.
-  setStatus(
-    'listening',
-    `DBG ${s.phase} rebuild=${ok} upgrade=${up} id=${boxes[0]?.containerID}` +
-      ` name=${boxes[0]?.containerName} len=${body.length}`,
-  )
-  console.log(`[assist] rebuild=${ok} upgrade=${up}`)
+  console.log(`[assist] ${s.phase} rebuild=${ok} upgrade=${upgraded}`)
 
   if (!ok) {
     // A z-order violation fails HERE, client-side, without ever reaching the
@@ -746,7 +697,6 @@ async function showCaptions() {
   bandOnPage = builtWithBand
   bandBorderOnPage = builtWithBorder
   stt?.dismiss()
-  noteBand('built')
   refreshStatus()
 
   // The session state may have changed while that rebuild was in flight, in
@@ -760,7 +710,6 @@ async function showCaptions() {
   // One corrective pass. It cannot loop: the second call captures the flag
   // as it now is, and only another session frame could move it again.
   if (isBandVisible() !== bandOnPage) {
-    noteBand('fix')
     syncCaptionColumns()
     await showCaptions()
   }
