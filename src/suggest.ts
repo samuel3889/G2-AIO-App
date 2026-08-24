@@ -179,7 +179,43 @@ const TAG_PREFIX = '> '
  * sync: a suggestion is fire-and-forget, arms nothing, and expiring it
  * leaves no server state behind.
  */
-export const SUGGEST_HOLD_MS = 15_000
+export const SUGGEST_HOLD_DEFAULT_MS = 15_000
+
+/**
+ * Bounds on a hold time that arrives from the gateway.
+ *
+ * The gateway's own slider is already clamped to its schema min/max
+ * (gateway.py Settings._coerce), so these are a SECOND line of defence, not
+ * the primary one: a malformed or hand-crafted frame must not be able to
+ * pin a suggestion on the lens forever, and must not be able to set a hold
+ * so short that the band flashes and clears before it can be read.
+ *
+ * Keep MAX at or above the gateway tunable's max, or moving the slider to
+ * its top will silently do less than it says.
+ */
+const HOLD_MIN_MS = 3_000
+const HOLD_MAX_MS = 120_000
+
+/**
+ * Turn whatever the 'suggest' frame carried into the hold time to use.
+ *
+ * The value travels ON THE FRAME rather than being fetched once at boot.
+ * That is deliberate: the settings panel writes to the gateway, and a phone
+ * that had read the value at startup would keep using the old one until the
+ * WebView was reloaded — which on this stack means killing and reopening
+ * the Even Hub app mid-conversation. Every suggestion carrying its own hold
+ * means the slider takes effect on the NEXT suggestion, with no round trip
+ * and no client-side cache to go stale.
+ *
+ * An absent or non-finite value falls back to the default, so a gateway
+ * that has not been updated yet still behaves exactly as before.
+ */
+export function resolveHoldMs(holdMs?: number): number {
+  if (typeof holdMs !== 'number' || !Number.isFinite(holdMs)) {
+    return SUGGEST_HOLD_DEFAULT_MS
+  }
+  return Math.min(Math.max(Math.round(holdMs), HOLD_MIN_MS), HOLD_MAX_MS)
+}
 
 /**
  * Render a suggestion into the string the band will hold.
@@ -217,6 +253,7 @@ export function formatSuggest(_tag: string, text: string): string {
  * that pauses the microphone.
  */
 export function suggestContainer(content: string): TextContainerProperty {
+  const shown = DEBUG_BAND_TEXT ?? content
   return new TextContainerProperty({
     // Full width. A suggestion has no speaker, so it is not offset by the
     // name column the way the transcript is.
@@ -224,13 +261,33 @@ export function suggestContainer(content: string): TextContainerProperty {
     yPosition: SUGGEST_Y,
     width: SCREEN_W,
     height: SUGGEST_BAND_H,
-    borderWidth: BAND_BORDER_WIDTH,
+    // THE OUTLINE FOLLOWS THE CONTENT.
+    //
+    // An empty band gets borderWidth 0, so a caption page with nothing to
+    // suggest shows no rectangle at the bottom of the lens — just blank
+    // space where the rows are still reserved.
+    //
+    // The space itself is NOT handed back, and cannot be: the caption
+    // columns' height is frozen at creation, so returning the rows would
+    // mean rebuilding both columns at a different height twice per
+    // suggestion and re-cutting the wrap each time. Reserving the rows for
+    // the whole session and only drawing the rule when there is something
+    // inside it keeps the columns' geometry constant across the change.
+    //
+    // borderWidth is itself frozen at creation, so main.ts has to REBUILD
+    // the page to cross this boundary — see pushSuggestion(), which
+    // switches from textContainerUpgrade to showCaptions() exactly when
+    // `content` goes from empty to non-empty or back. That is one rebuild
+    // when a suggestion appears and one when it lapses, and it is why the
+    // gateway's cooldown matters: at the default 45s cooldown this is two
+    // rebuilds a minute at most, not two per utterance.
+    borderWidth: shown ? BAND_BORDER_WIDTH : 0,
     borderColor: BAND_BORDER_COLOR,
     borderRadius: 0,
     paddingLength: CAPTION_PADDING,
     containerID: SUGGEST_ID,
     containerName: SUGGEST_NAME,
-    content: DEBUG_BAND_TEXT ?? content,
+    content: shown,
     isEventCapture: 0,
     zOrderIndex: SUGGEST_Z,
   })

@@ -126,8 +126,18 @@ export interface SttHooks {
    * Only fires when the gateway has SUGGEST_MODE=on. In `shadow` the
    * suggestion is generated and logged server-side but no frame is sent
    * (gateway.py:3832).
+   *
+   * `holdMs` is how long this suggestion should stay on the lens, taken
+   * from the frame's `hold_ms` field, which the gateway derives from the
+   * `suggest_hold_s` tunable at send time. It is OPTIONAL because a gateway
+   * older than that tunable sends no such field; main.ts falls back to
+   * SUGGEST_HOLD_DEFAULT_MS in that case via resolveHoldMs().
+   *
+   * The value rides on each frame rather than being fetched once, so moving
+   * the slider on the phone applies to the next suggestion without a
+   * WebView reload.
    */
-  onSuggest?: (tag: string, text: string) => void
+  onSuggest?: (tag: string, text: string, holdMs?: number) => void
 }
 
 const GATEWAY_URL = import.meta.env.VITE_GATEWAY_URL as string
@@ -435,9 +445,19 @@ export function startSttStream(
           // the page when captions come back, so a suggestion that lands
           // mid-exchange is not simply lost.
           console.log(
-            `[stt] suggest seq=${msg.seq} ${msg.tag} +${msg.llm_ms}ms: ${msg.text}`,
+            `[stt] suggest seq=${msg.seq} ${msg.tag} +${msg.llm_ms}ms ` +
+              `hold=${msg.hold_ms ?? 'default'}: ${msg.text}`,
           )
-          hooks.onSuggest?.(msg.tag, msg.text)
+          // hold_ms is passed through UNVALIDATED: clamping and the
+          // fallback both live in suggest.ts's resolveHoldMs(), so there is
+          // one place that decides what a hold time may be. This module's
+          // job is to hand the frame's fields to the hook, not to police
+          // them.
+          hooks.onSuggest?.(
+            msg.tag,
+            msg.text,
+            typeof msg.hold_ms === 'number' ? msg.hold_ms : undefined,
+          )
           break
 
         case 'wake':

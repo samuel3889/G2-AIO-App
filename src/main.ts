@@ -26,7 +26,7 @@ import {
   formatSuggest,
   SUGGEST_ID,
   SUGGEST_NAME,
-  SUGGEST_HOLD_MS,
+  resolveHoldMs,
 } from './suggest'
 import { assistantBox, OVERLAY_Q_ID, OVERLAY_NAME } from './overlay'
 import { RebuildPageContainer } from '@evenrealities/even_hub_sdk'
@@ -34,6 +34,7 @@ import { showMenuPage, MENU_ACTIONS, menuLabels, type MenuAction } from './menu'
 import { mountSessions, setLiveSession, refreshSessions } from './sessions'
 import { mountTabs } from './tabs'
 import { mountReview } from './review'
+import { mountPrompts } from './prompts'
 import {
   statusContainers,
   setDeviceStatus,
@@ -172,6 +173,26 @@ let suggestTimer: number | null = null
  * dropped because the rebuild it needed had already started.
  */
 let bandOnPage = false
+
+/**
+ * Whether the band CURRENTLY ON THE LENS was built with its outline drawn.
+ *
+ * Same relationship to `currentSuggestion !== ''` as bandOnPage has to
+ * isBandVisible(): one is what the page SHOULD be, this is what was
+ * actually built.
+ *
+ * It exists because borderWidth, like every other geometry property, is
+ * FROZEN at container creation - textContainerUpgrade replaces content and
+ * nothing else. So an empty band cannot have its rule removed by writing ''
+ * into it; the page has to be rebuilt with a borderWidth-0 container in its
+ * place. suggestContainer() derives the width from the content, so a
+ * rebuild carrying '' produces the outline-less band automatically and this
+ * flag is only ever a record of which one went up.
+ *
+ * Meaningless while bandOnPage is false - there is no band to have an
+ * outline. Set together with it in showCaptions().
+ */
+let bandBorderOnPage = false
 let renderTimer: number | null = null
 let currentNames = ''
 let currentText = INITIAL_CONTENT
@@ -272,6 +293,30 @@ async function pushSuggestion() {
   if (assistant !== null) return
   if (!isBandVisible()) return
   if (currentSuggestion === lastSuggestion) return
+
+  // THE OUTLINE NEEDS A REBUILD, THE TEXT DOES NOT.
+  //
+  // The band's border is drawn only when it holds something (suggest.ts),
+  // and borderWidth is frozen at container creation - so crossing the
+  // empty/non-empty boundary cannot be done with an upgrade. showCaptions()
+  // bakes currentSuggestion into the rebuild, which is exactly the string
+  // this function was about to write, so it does the whole job and returns.
+  //
+  // The caption columns are NOT re-cut first, unlike the band-visibility
+  // rebuild in onSession: their height depends on isBandVisible(), which
+  // has not moved here. The rows stay reserved either way and the wrap is
+  // unchanged, so currentText/currentNames are still correct.
+  //
+  // At most two rebuilds per suggestion - one to raise the outline, one to
+  // drop it - and the gateway's cooldown bounds how often that can happen.
+  // A suggestion REPLACED while another is up takes the cheap path below,
+  // because the outline is already on the page.
+  const needBorder = currentSuggestion !== ''
+  if (needBorder !== bandBorderOnPage) {
+    await showCaptions()
+    return
+  }
+
   lastSuggestion = currentSuggestion
   const ok = await bridge.textContainerUpgrade(
     new TextContainerUpgrade({
@@ -296,14 +341,30 @@ async function pushSuggestion() {
  * next session's first rebuild, hours later and with no relation to what was
  * being said.
  */
-function clearSuggestion() {
+function clearSuggestion(push = true) {
   if (suggestTimer !== null) {
     window.clearTimeout(suggestTimer)
     suggestTimer = null
   }
   currentSuggestion = ''
-  void pushSuggestion()
+  if (push) void pushSuggestion()
 }
+
+/**
+ * WHY `push` IS A PARAMETER
+ *
+ * On expiry, pushing is the whole point: the band is staying on the page and
+ * has to lose both its text and its outline, which now means a rebuild.
+ *
+ * On SESSION END it would be waste. onSession() clears the suggestion and
+ * then drops the band off the page entirely, and that second step is a page
+ * rebuild of its own - so pushing here would rebuild once to un-outline a
+ * band that is about to be removed, and again to remove it. Two full page
+ * rebuilds back to back, the first of them visible.
+ *
+ * The state is still cleared either way, which is what stops a suggestion
+ * from the last session reappearing on the first rebuild of the next one.
+ */
 
 /**
  * Recompute both caption columns WITHOUT queueing a render.
@@ -459,7 +520,10 @@ try {
         // The band leaves the page when the session stops, so anything in
         // it goes too - otherwise it would reappear on the first rebuild of
         // the NEXT session, unrelated to anything being said then.
-        if (!s.active) clearSuggestion()
+        // `false`: the band is about to leave the page with the session,
+        // and that rebuild happens a few lines below. Pushing here would
+        // rebuild the page twice in a row for one event.
+        if (!s.active) clearSuggestion(false)
 
         setBandVisible(s.active)
 
@@ -494,18 +558,25 @@ try {
         // mid-scroll. The count refreshes when the menu is next opened.
         refreshStatus()
       },
-      onSuggest: (tag: string, text: string) => {
+      onSuggest: (tag: string, text: string, holdMs?: number) => {
         // A newer suggestion REPLACES an older one and restarts the clock
         // rather than queueing behind it: two inside the hold window means
         // the second is the more relevant one, and the conversation has
         // already moved past the first.
         currentSuggestion = formatSuggest(tag, text)
+        // How long THIS suggestion stays up, read off the frame the gateway
+        // just sent - so the settings slider applies from the next
+        // suggestion onward with no reload. A replacement re-reads it, so
+        // moving the slider mid-conversation is picked up immediately.
+        const hold = resolveHoldMs(holdMs)
         if (suggestTimer !== null) window.clearTimeout(suggestTimer)
         suggestTimer = window.setTimeout(() => {
           suggestTimer = null
           currentSuggestion = ''
+          // This is now a page REBUILD, not an upgrade: the outline goes
+          // with the text.
           void pushSuggestion()
-        }, SUGGEST_HOLD_MS)
+        }, hold)
         void pushSuggestion()
       },
       onSummary: (id, _text) => {
@@ -547,6 +618,12 @@ mountSessions(
   },
   tabs.Conversations,
 )
+
+// Prompt library, in the same tab and mounted AFTER mountSessions() so the
+// recording controls stay at the top of the panel — hosts are appended to in
+// call order. Independent of `stt`: it only talks to the gateway over REST,
+// so a failed socket leaves prompt editing working.
+void mountPrompts(tabs.Conversations)
 
 if (stt) {
   await bridge.audioControl(true)
@@ -638,6 +715,12 @@ async function showCaptions() {
   // page has a band it was never built with, hiding the disagreement the
   // check below exists to catch.
   const builtWithBand = isBandVisible()
+  // Captured at the same moment and for the same reason: the container is
+  // built from currentSuggestion synchronously on entry to
+  // showTranscriptPage(), so what matters is the value NOW, not after the
+  // rebuild resolves. A suggestion landing mid-rebuild must not make this
+  // record claim an outline the page was never built with.
+  const builtWithBorder = builtWithBand && currentSuggestion !== ''
   const ok = await showTranscriptPage(
     bridge,
     currentText,
@@ -661,6 +744,7 @@ async function showCaptions() {
   lastSuggestion = currentSuggestion
   // What this page was ACTUALLY built with, captured above.
   bandOnPage = builtWithBand
+  bandBorderOnPage = builtWithBorder
   stt?.dismiss()
   noteBand('built')
   refreshStatus()
@@ -680,6 +764,15 @@ async function showCaptions() {
     syncCaptionColumns()
     await showCaptions()
   }
+
+  // Same correction, for the SUGGESTION rather than the band. A frame that
+  // arrived while this rebuild was in flight was baked into a page that had
+  // already been assembled, or compared against a stale bandBorderOnPage.
+  //
+  // A no-op in the ordinary case: pushSuggestion() returns immediately when
+  // currentSuggestion already matches what was built, which is what
+  // lastSuggestion was just set to. It cannot loop for the same reason.
+  void pushSuggestion()
 }
 
 /** Rebuild the menu page. Reads current state for its labels and header. */
