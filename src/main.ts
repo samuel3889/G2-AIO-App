@@ -26,7 +26,7 @@ import {
   homeContainer,
 } from './pages'
 import { mountSettings } from './settings'
-import { showPlexPage } from './plex'
+import { showListPage } from './listpage'
 import {
   formatSuggest,
   SUGGEST_ID,
@@ -146,7 +146,7 @@ let lastText = ''
  *
  * Held here rather than written straight to the container because
  * showTranscriptPage() BAKES IT INTO the rebuild. The caption page is rebuilt
- * on every return from the menu, a Plex list or an assistant box, and a
+ * on every return from the menu, a list page or an assistant box, and a
  * suggestion still inside its hold window has to survive that round trip -
  * a rebuild that dropped it would blank the band mid-countdown.
  */
@@ -198,7 +198,7 @@ let renderTimer: number | null = null
 let currentNames = ''
 let currentText = INITIAL_CONTENT
 
-// Which page is on the lens. In 'home', 'plex' and 'menu' modes the
+// Which page is on the lens. In 'home', 'list' and 'menu' modes the
 // transcript container does not exist, so textContainerUpgrade would target a
 // container that is not on the page — every caption render must be
 // suppressed until we rebuild.
@@ -207,7 +207,7 @@ let currentText = INITIAL_CONTENT
 // file is already written as `pageMode !== 'transcript'`, so adding it here is
 // what makes partials, finals, speaker names and suggestions all stay off the
 // lens while home is up, without touching any of them.
-type PageMode = 'home' | 'transcript' | 'plex' | 'menu'
+type PageMode = 'home' | 'transcript' | 'list' | 'menu'
 let pageMode: PageMode = 'home'
 
 // Conversate state, mirrored from the gateway. The gateway is authoritative;
@@ -236,13 +236,13 @@ let assistant: AssistantState | null = null
 let assistantReturnTo: PageMode = 'home'
 
 /**
- * The lines the Plex list currently on the lens was built from, or null.
+ * The lines the list currently on the lens was built from, or null.
  *
- * Needed because returning to 'plex' means REBUILDING the list — there is no
+ * Needed because returning to 'list' means REBUILDING it — there is no
  * page stack in this SDK and no way to read a container's contents back — so
  * without a copy of the lines there is nothing to return to.
  */
-let lastPlexLines: string[] | null = null
+let lastListLines: string[] | null = null
 
 function scheduleGlassesRender() {
   if (pageMode !== 'transcript') return
@@ -410,7 +410,12 @@ function hint(): string {
     return `${rec}Home · tap for menu`
   }
   if (pageMode === 'menu') return 'Menu · scroll · tap to select · double-tap to go back'
-  if (pageMode === 'plex') return 'Plex · scroll to browse · double-tap to go back'
+  if (pageMode === 'list') {
+    // Title comes from the header line the gateway sent, so the hint names
+    // whatever is actually on the lens rather than one hardcoded source.
+    const title = lastListLines?.[0] ?? 'List'
+    return `${title} · scroll to browse · double-tap to go back`
+  }
   const rec = sessionActive ? `Recording (${sessionUtterances}) · ` : ''
   const mic = micOn ? 'Microphone live' : 'Paused'
   return `${rec}${mic} · tap to ${micOn ? 'pause' : 'resume'} · double-tap for menu`
@@ -443,22 +448,23 @@ try {
       setStatus('error', `STT error: ${(err as Error)?.message ?? err}`)
       console.error('STT error:', err)
     },
-    // Structured answer (Plex activity): render as a scrollable OS list.
+    // Structured answer — Plex activity, a Sparky card — rendered as a
+    // scrollable OS list. lines[0] is the HEADER, not an item.
     async lines => {
       // Kept so restoreFromAssistant() can rebuild this exact list. The page
       // is a rebuild like any other and the SDK gives no way to read a
       // container's contents back, so the only copy of what was on the lens
       // is the one we keep here.
-      lastPlexLines = lines
-      const ok = await showPlexPage(bridge, lines)
+      lastListLines = lines
+      const ok = await showListPage(bridge, lines)
       if (!ok) {
         // rebuildPageContainer returns boolean, NOT the numeric result code
         // createStartUpPageContainer gives - `!ok`, not `!== 0`.
-        setStatus('error', 'rebuildPageContainer failed (plex)')
-        console.error('Failed to build plex page')
+        setStatus('error', 'rebuildPageContainer failed (list)')
+        console.error('Failed to build list page')
         return
       }
-      pageMode = 'plex'
+      pageMode = 'list'
       refreshStatus()
     },
     {
@@ -502,7 +508,7 @@ try {
         // several times a minute.
         //
         // Only rebuild if the caption page is the thing on screen. From the
-        // menu, a Plex list or an assistant box, a rebuild here would yank
+        // menu, a list page or an assistant box, a rebuild here would yank
         // the display out from under the user - and it is not needed, since
         // showCaptions() reads the flag when it next builds the page anyway.
         // The band leaves the page when the session stops, so anything in
@@ -525,7 +531,7 @@ try {
         // captions.
         //
         // Still skipped unless captions are the thing on screen: from the
-        // menu, a Plex list or an assistant box a rebuild would yank the
+        // menu, a list page or an assistant box a rebuild would yank the
         // display out from under the user, and showCaptions() reads the flag
         // when it next builds the page anyway.
         if (isBandVisible() !== bandOnPage && pageMode === 'transcript' && assistant === null) {
@@ -574,7 +580,7 @@ try {
         // showCaptions() below calls dismiss() — so handling a null when
         // there is already no assistant re-enters showCaptions forever.
         // That loop repaints the caption page continuously, which is what
-        // wiped the menu and the Plex list a few ms after they rendered.
+        // wiped the menu and the list page a few ms after they rendered.
         // A null when nothing is up means there is nothing to hand back.
         if (s === null && assistant === null) return
 
@@ -696,7 +702,7 @@ async function renderAssistant(s: AssistantState) {
 /** Rebuild the caption page and hand the display back to the transcript. */
 async function showCaptions() {
   // Diagnostic: if this repeats without a gesture, a page-rebuild loop is
-  // running and it is what is wiping the menu and the Plex list.
+  // running and it is what is wiping the menu and the list page.
   console.log(`[page] captions (from ${pageMode})`)
   // Read the flag BEFORE the await, because that is when the page is built
   // from it: showTranscriptPage() spreads suggestContainers() synchronously
@@ -807,11 +813,11 @@ async function showHome() {
  * overlay, and closeAssistant() returns immediately when there is nothing to
  * close.
  *
- * The 'plex' case rebuilds the list from the retained lines. If a structured
+ * The 'list' case rebuilds it from the retained lines. If a structured
  * answer is what ENDED this exchange, stt.ts fires onAssistant(null) and then
- * onLines() — so a return to plex here can be immediately replaced by the new
- * list. Both are plex pages, so the worst case is one wasted rebuild, not a
- * wrong page.
+ * onLines() — so a return to the list here can be immediately replaced by the
+ * new one. Both are list pages, so the worst case is one wasted rebuild, not
+ * a wrong page.
  */
 async function restoreFromAssistant() {
   console.log(`[assist] returning to ${assistantReturnTo}`)
@@ -822,17 +828,17 @@ async function restoreFromAssistant() {
     case 'menu':
       await showMenu()
       break
-    case 'plex':
+    case 'list':
       // No retained lines means the list was never built in this session —
       // fall through to captions rather than rebuild an empty list.
-      if (lastPlexLines) {
-        const ok = await showPlexPage(bridge, lastPlexLines)
+      if (lastListLines) {
+        const ok = await showListPage(bridge, lastListLines)
         if (!ok) {
-          setStatus('error', 'rebuildPageContainer failed (plex)')
-          console.error('Failed to rebuild plex page')
+          setStatus('error', 'rebuildPageContainer failed (list)')
+          console.error('Failed to rebuild list page')
           return
         }
-        pageMode = 'plex'
+        pageMode = 'list'
         lastNames = ''
         lastText = ''
         refreshStatus()
@@ -1022,7 +1028,7 @@ const unsubscribe = bridge.onEvenHubEvent(event => {
 
   const sysType = eventTypeOf(event.sysEvent)
   const textType = eventTypeOf(event.textEvent)
-  // In list modes (plex, menu) the LIST holds isEventCapture, so taps and
+  // In list modes (list, menu) the LIST holds isEventCapture, so taps and
   // scrolls arrive as listEvent rather than textEvent.
   const listType = eventTypeOf(event.listEvent)
 
@@ -1071,11 +1077,11 @@ const unsubscribe = bridge.onEvenHubEvent(event => {
         event.listEvent?.currentSelectItemIndex,
         event.listEvent?.currentSelectItemName,
       )
-    } else if (pageMode === 'plex') {
+    } else if (pageMode === 'list') {
       // Nothing to select in a read-only list. Logged so the index is
       // visible; double tap is how you leave.
       console.log(
-        '[plex] select ->',
+        '[list] select ->',
         event.listEvent?.currentSelectItemIndex,
         event.listEvent?.currentSelectItemName,
       )

@@ -5,7 +5,7 @@
  * replaces the entire page, so "persist across pages" can only mean: every
  * page builder includes these two containers. This module owns their
  * geometry, their text, and the device state they read from, so the four
- * page builders (startup, transcript, plex, menu, assistant) cannot drift
+ * page builders (startup, transcript, list, menu, assistant) cannot drift
  * apart.
  *
  * The device state lives HERE rather than being threaded through every
@@ -36,7 +36,7 @@ export const STATUS_H = 32
 /**
  * Container IDs, deliberately clear of everything else.
  *
- * The allocation across this app is: 1 = transcript, 2/3 = plex
+ * The allocation across this app is: 1 = transcript, 2/3 = list
  * header/list, 4/5 = menu header/list, and 6 = the assistant overlay box
  * (OVERLAY_Q_ID in overlay.ts). 6/7 therefore COLLIDES with the overlay —
  * that collision is what made the assistant box lose its border, shrink to
@@ -243,7 +243,7 @@ export function statusContainers(now: Date = new Date()): TextContainerProperty[
 
 /**
  * The two bridge methods this module needs, declared structurally rather
- * than by importing EvenAppBridge - same approach as showPlexPage and
+ * than by importing EvenAppBridge - same approach as showListPage and
  * showMenuPage, which take the one method they call.
  */
 export interface StatusBridge {
