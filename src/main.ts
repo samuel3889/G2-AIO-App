@@ -21,14 +21,13 @@ import {
   NAMES_NAME,
   TRANSCRIPT_ID,
   TRANSCRIPT_NAME,
-  namesContainer,
   showTranscriptPage,
-  transcriptContainer,
+  showHomePage,
+  homeContainer,
 } from './pages'
 import { mountSettings } from './settings'
 import { showPlexPage } from './plex'
 import {
-  suggestContainers,
   formatSuggest,
   SUGGEST_ID,
   SUGGEST_NAME,
@@ -90,11 +89,10 @@ try {
   console.warn('[status] getDeviceInfo failed:', err)
 }
 
-// What the transcript container holds before anything has been said. Held in
-// a constant because it is needed in two places — the startup container built
-// below, and `currentText`, which the debounced renderer diffs against. Two
-// literals here would mean the first render after boot was a no-op or a
-// redundant write depending on which one drifted.
+// What the transcript container holds before anything has been said. No
+// longer on the startup page — the app now launches into the blank HOME page
+// — but still the value `currentText` starts at, so the first caption page
+// built has something in it rather than an empty column.
 //
 // captions.ts's CAPTION_RULER probe is deliberately NOT consulted here. It is
 // read inside captionColumns(), so turning it on still replaces the captions
@@ -102,27 +100,20 @@ try {
 // first render.
 const INITIAL_CONTENT = 'Listening…'
 
-// GEOMETRY LIVES IN pages.ts. This used to be an inline
-// TextContainerProperty spanning the full 576, duplicating
-// transcriptContainer()'s layout. Now that the caption page is TWO columns, a
-// second copy of the geometry would drift from the one showTranscriptPage()
-// builds and the columns would stop lining up after the first rebuild.
-const transcript = transcriptContainer(INITIAL_CONTENT, 1)
-
-// FOUR containers at startup: transcript 0, names 1, clock 10, battery 11.
-// zOrderIndex is ALL-OR-NOTHING per page and unique across all of them.
+// THE LAUNCH PAGE IS BLANK: the status strip and nothing else.
 //
-// suggestContainers() is spread here for the same reason showTranscriptPage()
-// does it, but at boot it returns EMPTY - no session is recording, so the
-// band is not up and the captions get the full nine rows. It is spread
-// rather than omitted so that this page and the rebuilt one are built the
-// same way and cannot drift.
-const startupText = [
-  transcript,
-  namesContainer(''),
-  ...suggestContainers(),
-  ...statusContainers(),
-]
+// homeContainer() is the invisible full-screen container underneath it. It is
+// not decoration — statusContainers() sets isEventCapture 0 on both strip
+// containers, so without it NOTHING on this page captures events and there is
+// no gesture that leads off it. See pages.ts:HOME_ID.
+//
+// THREE containers at startup: home 0, clock 10, battery 11. zOrderIndex is
+// ALL-OR-NOTHING per page and unique across all of them.
+//
+// This deliberately does NOT go through showHomePage(): the startup call is
+// once per app lifetime and must be createStartUpPageContainer, which returns
+// a numeric result code rather than the boolean rebuildPageContainer gives.
+const startupText = [homeContainer(), ...statusContainers()]
 
 const created = await bridge.createStartUpPageContainer(
   new CreateStartUpPageContainer({
@@ -207,12 +198,17 @@ let renderTimer: number | null = null
 let currentNames = ''
 let currentText = INITIAL_CONTENT
 
-// Which page is on the lens. In 'plex' and 'menu' modes the transcript
-// container does not exist, so textContainerUpgrade would target a
+// Which page is on the lens. In 'home', 'plex' and 'menu' modes the
+// transcript container does not exist, so textContainerUpgrade would target a
 // container that is not on the page — every caption render must be
 // suppressed until we rebuild.
-type PageMode = 'transcript' | 'plex' | 'menu'
-let pageMode: PageMode = 'transcript'
+//
+// 'home' is the LAUNCH mode and the blank page. Every render guard in this
+// file is already written as `pageMode !== 'transcript'`, so adding it here is
+// what makes partials, finals, speaker names and suggestions all stay off the
+// lens while home is up, without touching any of them.
+type PageMode = 'home' | 'transcript' | 'plex' | 'menu'
+let pageMode: PageMode = 'home'
 
 // Conversate state, mirrored from the gateway. The gateway is authoritative;
 // this is only what the lens and phone display.
@@ -226,6 +222,27 @@ let micOn = false
 // textContainerUpgrade aimed at it would be writing into a container that
 // does not exist.
 let assistant: AssistantState | null = null
+
+/**
+ * The page that was on the lens when the CURRENT assistant exchange began, and
+ * therefore the page to rebuild when it ends.
+ *
+ * Written once per exchange, on the none -> box transition in onAssistant, and
+ * read by restoreFromAssistant(). 'home' is the initial value for the same
+ * reason pageMode is: that is what the app launches into, so an exchange
+ * triggered before any page change returns to a blank lens rather than to
+ * captions the user never opened.
+ */
+let assistantReturnTo: PageMode = 'home'
+
+/**
+ * The lines the Plex list currently on the lens was built from, or null.
+ *
+ * Needed because returning to 'plex' means REBUILDING the list — there is no
+ * page stack in this SDK and no way to read a container's contents back — so
+ * without a copy of the lines there is nothing to return to.
+ */
+let lastPlexLines: string[] | null = null
 
 function scheduleGlassesRender() {
   if (pageMode !== 'transcript') return
@@ -388,6 +405,10 @@ function setLensMessage(msg: string) {
 // Phone status line. One place, because it now has to account for three
 // page modes and a recording flag.
 function hint(): string {
+  if (pageMode === 'home') {
+    const rec = sessionActive ? `Recording (${sessionUtterances}) · ` : ''
+    return `${rec}Home · tap for menu`
+  }
   if (pageMode === 'menu') return 'Menu · scroll · tap to select · double-tap to go back'
   if (pageMode === 'plex') return 'Plex · scroll to browse · double-tap to go back'
   const rec = sessionActive ? `Recording (${sessionUtterances}) · ` : ''
@@ -424,6 +445,11 @@ try {
     },
     // Structured answer (Plex activity): render as a scrollable OS list.
     async lines => {
+      // Kept so restoreFromAssistant() can rebuild this exact list. The page
+      // is a rebuild like any other and the SDK gives no way to read a
+      // container's contents back, so the only copy of what was on the lens
+      // is the one we keep here.
+      lastPlexLines = lines
       const ok = await showPlexPage(bridge, lines)
       if (!ok) {
         // rebuildPageContainer returns boolean, NOT the numeric result code
@@ -552,14 +578,28 @@ try {
         // A null when nothing is up means there is nothing to hand back.
         if (s === null && assistant === null) return
 
+        // Remember where the exchange STARTED, on the transition into it
+        // only. This hook fires again on every phase change (listening ->
+        // question -> thinking -> answer), and by then pageMode has already
+        // been overwritten below — capturing on each one would record
+        // 'transcript' every time, which is exactly the bug that used to send
+        // every dismissal to the caption page.
+        if (s && assistant === null) {
+          assistantReturnTo = pageMode
+          console.log(`[assist] launched from ${assistantReturnTo}`)
+        }
+
         assistant = s
         if (s) {
           // The overlay REPLACES whatever page was up, including a list.
-          // pageMode records where captions resume from when it clears.
+          // pageMode goes to 'transcript' for the duration because every
+          // render guard in this file pairs it with `assistant === null`;
+          // where the lens actually returns to is assistantReturnTo, captured
+          // above.
           pageMode = 'transcript'
           void renderAssistant(s)
         } else {
-          void showCaptions()
+          void restoreFromAssistant()
         }
       },
     },
@@ -724,6 +764,87 @@ async function showCaptions() {
   void pushSuggestion()
 }
 
+/**
+ * Rebuild the blank home page and hand the lens back to it.
+ *
+ * Deliberately does NOT call stt?.dismiss() the way showCaptions() does.
+ * dismiss() fires onAssistant(null), which now calls restoreFromAssistant() —
+ * and when the exchange was launched from home, that calls straight back into
+ * this function. A dismiss() here would be a page-rebuild loop. Home is only
+ * ever reached by a gesture, and the assistant box owns the gestures while it
+ * is up, so there is nothing to dismiss on this path anyway.
+ *
+ * lastNames/lastText are cleared for the same reason showCaptions() sets them:
+ * the caption containers are not on this page, so whatever they hold no longer
+ * describes the lens.
+ */
+async function showHome() {
+  console.log(`[page] home (from ${pageMode})`)
+  const ok = await showHomePage(bridge)
+  if (!ok) {
+    setStatus('error', 'rebuildPageContainer failed (home)')
+    console.error('Failed to build home page')
+    return
+  }
+  pageMode = 'home'
+  lastNames = ''
+  lastText = ''
+  // The band container is not on this page either, so a suggestion arriving
+  // now must not be recorded as already written. pushSuggestion() is guarded
+  // by pageMode anyway; this keeps the cache honest for the next rebuild.
+  lastSuggestion = ''
+  bandOnPage = false
+  bandBorderOnPage = false
+  refreshStatus()
+}
+
+/**
+ * Hand the lens back to whatever page the assistant exchange interrupted.
+ *
+ * Called ONLY from onAssistant's null branch, which is itself guarded against
+ * firing when no box was up — so this cannot re-enter: showCaptions() calls
+ * stt.dismiss(), but by the time we get here stt.ts has already cleared its
+ * overlay, and closeAssistant() returns immediately when there is nothing to
+ * close.
+ *
+ * The 'plex' case rebuilds the list from the retained lines. If a structured
+ * answer is what ENDED this exchange, stt.ts fires onAssistant(null) and then
+ * onLines() — so a return to plex here can be immediately replaced by the new
+ * list. Both are plex pages, so the worst case is one wasted rebuild, not a
+ * wrong page.
+ */
+async function restoreFromAssistant() {
+  console.log(`[assist] returning to ${assistantReturnTo}`)
+  switch (assistantReturnTo) {
+    case 'home':
+      await showHome()
+      break
+    case 'menu':
+      await showMenu()
+      break
+    case 'plex':
+      // No retained lines means the list was never built in this session —
+      // fall through to captions rather than rebuild an empty list.
+      if (lastPlexLines) {
+        const ok = await showPlexPage(bridge, lastPlexLines)
+        if (!ok) {
+          setStatus('error', 'rebuildPageContainer failed (plex)')
+          console.error('Failed to rebuild plex page')
+          return
+        }
+        pageMode = 'plex'
+        lastNames = ''
+        lastText = ''
+        refreshStatus()
+      } else {
+        await showCaptions()
+      }
+      break
+    default:
+      await showCaptions()
+  }
+}
+
 /** Rebuild the menu page. Reads current state for its labels and header. */
 async function showMenu() {
   const ok = await showMenuPage(bridge, {
@@ -837,11 +958,18 @@ async function goBack() {
     stt?.dismiss()
     return
   }
-  if (pageMode === 'transcript') {
-    // Captions is the launch page, so "back" from here goes up to the menu.
+  // Home is the ROOT now, and the hierarchy is home -> menu -> everything
+  // else. So "back" from a feature page goes to the menu's parent, home —
+  // never to captions, which is one of the things the menu launches rather
+  // than the page underneath it.
+  if (pageMode === 'home') {
+    // Nothing above home. The only useful thing a gesture can do here is open
+    // the menu, and both gestures do it rather than one of them being dead.
+    await showMenu()
+  } else if (pageMode === 'transcript') {
     await showMenu()
   } else {
-    await showCaptions()
+    await showHome()
   }
 }
 
@@ -951,6 +1079,15 @@ const unsubscribe = bridge.onEvenHubEvent(event => {
         event.listEvent?.currentSelectItemIndex,
         event.listEvent?.currentSelectItemName,
       )
+    } else if (pageMode === 'home') {
+      // The home page shows nothing, so there is nothing on it to act on.
+      // Tap opens the menu — the same thing double tap does, because a blank
+      // page with one dead gesture is indistinguishable from a hung one.
+      //
+      // NOT toggleMic(): the mic state is invisible from here, so a tap that
+      // silently paused capture would be discoverable only by its
+      // consequences.
+      void showMenu()
     } else {
       // Caption mode: tap is the primary action, and the primary action
       // here is pausing capture.

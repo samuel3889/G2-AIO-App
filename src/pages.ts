@@ -90,6 +90,32 @@ export const MESSAGE_ID = 9
 export const MESSAGE_NAME = 'message'
 
 /**
+ * The HOME page's one and only content container - full screen, empty, and
+ * invisible.
+ *
+ * WHY IT EXISTS AT ALL, ON A PAGE THAT IS MEANT TO BE BLANK
+ *
+ * statusContainers() hard-codes `isEventCapture: 0` on both strip containers
+ * (statusbar.ts), because exactly one container per page may capture events
+ * and on every other page that has to be the page's own content. A page built
+ * from the strip ALONE therefore captures nothing: no tap, no double tap, and
+ * no way off the home page short of a long press that kills the widget.
+ *
+ * So home gets one container that is full-screen and event-capturing but
+ * draws nothing - `content: ''` with `borderWidth: 0`. The lens shows the
+ * clock and the battery and otherwise stays dark, which is the point, and the
+ * gestures still arrive.
+ *
+ * Its own ID (12) rather than reusing MESSAGE_ID: allocation is 1
+ * transcript, 2/3 plex, 4/5 menu, 6/7 assistant overlay, 8 names, 9 message,
+ * 10/11 status. A colliding ID rebuilds cleanly and returns true, then
+ * swallows its own textContainerUpgrade - the failure mode is silent, so the
+ * only defence is not colliding.
+ */
+export const HOME_ID = 12
+export const HOME_NAME = 'home'
+
+/**
  * The transcript container on its own.
  *
  * Exported so any page builder can compose one containing BOTH the
@@ -255,6 +281,53 @@ export async function showMessagePage(
   content: string,
 ): Promise<boolean> {
   const text = [messageContainer(content), ...statusContainers()]
+  return bridge.rebuildPageContainer(
+    new RebuildPageContainer({
+      containerTotalNum: text.length,
+      textObject: text,
+    }),
+  )
+}
+/**
+ * The invisible full-screen container that backs the home page.
+ *
+ * Geometry matches messageContainer() - below the strip, full width - but it
+ * never holds text, so nothing here is derived from the caption constants and
+ * nothing depends on this staying in step with them.
+ */
+export function homeContainer(): TextContainerProperty {
+  return new TextContainerProperty({
+    xPosition: 0,
+    yPosition: STATUS_H,
+    width: 576,
+    height: 288 - STATUS_H,
+    borderWidth: 0,
+    borderColor: 5,
+    paddingLength: 4,
+    containerID: HOME_ID,
+    containerName: HOME_NAME,
+    content: '',
+    // The whole reason this container exists. See HOME_ID above.
+    isEventCapture: 1,
+    zOrderIndex: 0,
+  })
+}
+
+/**
+ * The HOME page: blank lens, status strip only.
+ *
+ * This is what the app launches into. Three containers: home 0, clock 10,
+ * battery 11 - zOrderIndex is all-or-nothing per page and unique across it.
+ *
+ * Nothing is written into the home container ever, so there is no
+ * textContainerUpgrade path to it and no render state to keep in step. The
+ * caption page is reached from the menu, and main.ts suppresses every caption
+ * write while this page is up.
+ */
+export async function showHomePage(
+  bridge: { rebuildPageContainer: (c: RebuildPageContainer) => Promise<boolean> },
+): Promise<boolean> {
+  const text = [homeContainer(), ...statusContainers()]
   return bridge.rebuildPageContainer(
     new RebuildPageContainer({
       containerTotalNum: text.length,
