@@ -87,6 +87,13 @@ interface SessionRow {
   title: string
   started: number | null
   utterances: number
+  /**
+   * Unexpired clips still on disk, from session_index(). Sessions recorded
+   * before this field existed will not carry it, which is why the filter
+   * below treats `undefined` as "keep" rather than as zero — dropping every
+   * older session from the picker on upgrade day would look like data loss.
+   */
+  clips?: number
 }
 
 /** Below this an embedding is noise on this mic — measured, not guessed. */
@@ -620,13 +627,30 @@ export function mountReview(host?: HTMLElement) {
 
   async function loadSessions() {
     try {
-      const r = await fetch(restUrl('/sessions'))
+      // with_clips=1: the gateway drops sessions whose audio has expired
+      // before they ever reach the phone. restUrl() switches to '&' for the
+      // token because the path already carries a query string.
+      const r = await fetch(restUrl('/sessions?with_clips=1'))
       if (!r.ok) throw new Error(`${r.status}`)
-      const items = ((await r.json()).sessions ?? []) as SessionRow[]
+      const all = ((await r.json()).sessions ?? []) as SessionRow[]
+
+      // Belt and braces, and the reason deploy order does not matter: a
+      // gateway that predates with_clips ignores the param and returns
+      // everything, and this catches the expired rows client-side. Against
+      // the current gateway it filters nothing.
+      const items = all.filter(s => s.clips === undefined || s.clips > 0)
+
       pick.innerHTML = ''
       if (!items.length) {
-        pick.innerHTML = '<option>(nothing recorded)</option>'
-        listEl.textContent = 'Nothing recorded yet.'
+        pick.innerHTML = '<option>(no retained audio)</option>'
+        // Deliberately one message for two cases. The filtered response
+        // cannot tell "nothing recorded" from "everything expired" — the
+        // expired rows never arrive — and inventing a distinction from a
+        // count this endpoint no longer returns would be a guess. The
+        // second sentence is true either way and points somewhere useful.
+        listEl.textContent =
+          'No sessions with retained audio. Recorded sessions keep their ' +
+          'transcripts on the Sessions tab after their clips expire.'
         return
       }
       for (const s of items) {
