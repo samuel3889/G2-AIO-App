@@ -456,6 +456,18 @@ try {
       // container's contents back, so the only copy of what was on the lens
       // is the one we keep here.
       lastListLines = lines
+      // The list page IS the handover out of the assistant exchange, so the
+      // assistant state is cleared HERE rather than by an onAssistant(null)
+      // from stt.ts. That null used to arrive one statement before this
+      // callback and sent us into restoreFromAssistant(), which rebuilt the
+      // caption page underneath this build - two rebuildPageContainer calls
+      // racing, and this one returning false.
+      //
+      // Cleared BEFORE the await so a caption frame landing mid-rebuild
+      // cannot be blocked by a stale box; pageMode is still 'transcript'
+      // until the build succeeds, and scheduleGlassesRender()'s own re-check
+      // catches the switch.
+      assistant = null
       const ok = await showListPage(bridge, lines)
       if (!ok) {
         // rebuildPageContainer returns boolean, NOT the numeric result code

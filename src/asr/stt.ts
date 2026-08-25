@@ -498,15 +498,26 @@ export function startSttStream(
 
         case 'answer':
           console.log(`[stt] answer (+${msg.llm_ms}ms): ${msg.text}`)
-          // Structured answers (currently only Plex) render as a scrollable
+          // Structured answers (Plex, a Sparky card) render as a scrollable
           // list rather than a text overlay. Still set `overlay` so captions
           // stop writing to the lens underneath the list - clearing it is
           // what hands the display back.
+          //
+          // DELIBERATELY NO onAssistant(null) HERE. It used to fire just
+          // before onLines(), and main.ts reads a null as "the exchange is
+          // over, put the previous page back" - so restoreFromAssistant()
+          // rebuilt the caption page (firing dismiss() -> closeAssistant() ->
+          // 'endconvo') while showListPage() was rebuilding the list. Two
+          // rebuildPageContainer calls in flight at once, and the list lost:
+          // 'rebuildPageContainer failed (list)' with the box vanishing off
+          // the lens a frame earlier.
+          //
+          // The list page IS the handover, so main.ts clears its assistant
+          // state in its own onLines handler instead - one rebuild, not two.
           if (Array.isArray(msg.lines) && msg.lines.length && onLines) {
             overlay = msg.text
             if (overlayTimer !== null) clearTimeout(overlayTimer)
             overlayTimer = null // no auto-dismiss: the user scrolls it
-            hooks.onAssistant?.(null)
             onLines(msg.lines)
           } else {
             overlay = 'answer'

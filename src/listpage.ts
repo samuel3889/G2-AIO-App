@@ -66,6 +66,31 @@ export const LIST_ITEMS_ID = 3
 const LIST_ITEMS_NAME = 'lens-list'
 
 /**
+ * Header container name. ELEVEN characters, deliberately.
+ *
+ * Was 'lens-list-header' (16), and that alone stopped this page building:
+ * every rebuild returned false with no [EvenHub:...] line on the console,
+ * because the shipped validator does not inspect containerName - the HOST
+ * rejected the page. The tell was that a list with zero items renders fine
+ * (it falls through to showMessagePage below, which uses 'message', 7 chars)
+ * while every real list page failed, and menu.ts builds a structurally
+ * identical page with 'menu-header', 11 chars, and works.
+ *
+ * Every container name that renders in this app is <= 12 characters:
+ * 'transcript', 'names', 'message', 'home', 'assist', 'status-clock',
+ * 'status-batt', 'menu-header', 'menu-list'. The 16-char one was the only
+ * outlier and the only broken page.
+ *
+ * The "capped at 16 characters" comments in statusbar.ts and overlay.ts are
+ * UNVERIFIED and, on this evidence, wrong or off by one - index.d.ts only
+ * declares `containerName?: string` and states no limit. 16 may be the
+ * buffer size with a NUL terminator eating the last byte. Until someone
+ * measures where the real edge is, keep new names short rather than
+ * treating 16 as safe.
+ */
+const LIST_HEADER_NAME = 'list-header'
+
+/**
  * Build the page: header text + scrollable list.
  *
  * `lines[0]` is the header ("3 streams", "Calories", "Water · Fri Aug 21");
@@ -107,7 +132,7 @@ export async function showListPage(
     borderWidth: 0,
     paddingLength: 4,
     containerID: LIST_HEADER_ID,
-    containerName: 'lens-list-header',
+    containerName: LIST_HEADER_NAME,
     // zOrderIndex is ALL-OR-NOTHING per page: because the list below sets
     // one, this must too, or the whole rebuild is rejected client-side with
     // MISSING_Z_ORDER_INDEX and never reaches the glasses.
