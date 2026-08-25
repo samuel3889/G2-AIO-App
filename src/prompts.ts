@@ -1,26 +1,39 @@
 /**
- * Phone-side prompt library: the titled suggestion prompts the gateway
- * stores in /data/prompts.json, with one marked active.
+ * Phone-side prompt library: the titled suggestion prompts the gateway stores
+ * in /data/prompts.json, with one marked active.
  *
- * Replaces editing SUGGEST_PROMPT in .env. That value is now only a SEED
- * for an empty store on first boot; once a prompt exists here it is what
- * the suggester sends, and .env is never consulted again.
+ * Replaces editing SUGGEST_PROMPT in .env. That value is now only a SEED for an
+ * empty store on first boot; once a prompt exists here it is what the suggester
+ * sends, and .env is never consulted again.
  *
- * The .env quoting rules DO NOT APPLY to anything typed here. Quotes, $, #
- * and newlines are all safe: this travels as JSON and lands in a JSON file,
- * so none of the shell interpolation that truncated .env values can happen.
+ * The .env quoting rules DO NOT APPLY to anything typed here. Quotes, $, # and
+ * newlines are all safe: this travels as JSON and lands in a JSON file, so none
+ * of the shell interpolation that truncated .env values can happen.
  *
- * Mounts to the host it is given, matching mountSettings() and
- * mountSessions() — NOT to #app, which ui.ts overwrites wholesale.
+ * Unlike the tuning sliders, edits here are NOT debounced-and-autosaved. A
+ * prompt is 2600 characters of carefully weighed text, and a half-typed sentence
+ * reaching the model mid-session is a worse failure than an extra tap. Nothing
+ * leaves the phone until Save is pressed.
  *
- * Unlike the tuning sliders, edits here are NOT debounced-and-autosaved.
- * A prompt is 2600 characters of carefully weighed text, and a half-typed
- * sentence reaching the model mid-session is a worse failure than an extra
- * tap. Nothing leaves the phone until Save is pressed.
+ * PUBLIC SURFACE IS UNCHANGED — mountPrompts(host) keeps its name and signature.
  *
- * The gateway URL rule and the token live in api.ts.
+ * WHAT CHANGED IN THIS PASS
+ *  - The panel is a card, so it stacks with the recording card above it instead
+ *    of being a second differently-coloured slab.
+ *  - What is actually being sent is a chip in the card header, visible without
+ *    reading the body.
+ *  - The editor's Save/Cancel/Delete bar sticks to the bottom of the editor, so
+ *    a 46vh textarea does not push Save off the screen.
+ *
+ * Endpoints used, all as defined in routes_prompts.py:
+ *   GET    /prompts               -> { active, prompts, effective }
+ *   POST   /prompts               -> create
+ *   PUT    /prompts/{id}          -> update
+ *   POST   /prompts/{id}/activate
+ *   DELETE /prompts/{id}
  */
 import { restBase, restUrl } from './api'
+import { installTheme, makeCard, icon } from './theme'
 
 interface StoredPrompt {
   id: string
@@ -37,62 +50,64 @@ interface Store {
 }
 
 const CSS = `
-.g2pr { font: 14px/1.4 system-ui, sans-serif; padding: 12px; max-width: 560px;
-        margin: 12px auto; background: #111; color: #eee; border-radius: 10px; }
-.g2pr h3 { margin: 0 0 4px; font-size: 15px; }
-.g2pr .sub { color: #888; font-size: 12px; margin-bottom: 12px; }
-.g2pr .eff { background: #1c1c1c; border-radius: 8px; padding: 8px 10px;
-             margin-bottom: 12px; font-size: 12px; color: #9df; }
-.g2pr .row { background: #1a1a1a; border-radius: 8px; padding: 10px;
-             margin-bottom: 8px; }
-.g2pr .row.on { border-left: 3px solid #6cf; }
-.g2pr .ttl { font-weight: 600; display: block; }
-.g2pr .meta { color: #888; font-size: 12px; }
-.g2pr .badge { color: #6cf; font-size: 12px; font-weight: 600; }
-.g2pr .btns { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 8px; }
-.g2pr button { background: #333; color: #eee; border: 0; border-radius: 6px;
-               padding: 9px 12px; font-size: 13px; touch-action: manipulation; }
-.g2pr button:active { background: #444; }
-.g2pr button:disabled { opacity: .5; }
-.g2pr button.primary { background: #6cf; color: #062; font-weight: 600; }
-.g2pr button.danger { background: #3a1c1c; color: #ff6b60; }
-
-/* 16px on the inputs stops the browser zooming the whole page in on focus,
-   which on a phone leaves the panel scrolled sideways and half off-screen. */
-.g2pr input, .g2pr textarea { width: 100%; box-sizing: border-box;
-       background: #0d0d0d; color: #eee; border: 1px solid #333;
-       border-radius: 6px; padding: 8px; font: 16px/1.4 system-ui, sans-serif; }
-.g2pr textarea { min-height: 46vh; resize: vertical; white-space: pre-wrap; }
-.g2pr .count { color: #888; font-size: 12px; margin: 4px 0 8px; }
-.g2pr .lbl { color: #888; font-size: 12px; margin: 8px 0 4px; }
-.g2pr .state { font-size: 12px; color: #888; margin-left: 4px; }
-.g2pr .err { color: #f66; }
+.g2pr .eff {
+  display: flex; align-items: center; gap: 8px;
+  padding: 10px 12px; margin-bottom: 12px; border-radius: var(--r2);
+  background: var(--sunken); border: 1px solid var(--line-soft);
+  font-size: 12px; color: var(--text-2);
+}
+.g2pr .eff .who { color: var(--info); font-weight: 650; overflow-wrap: anywhere; }
+.g2pr .count { color: var(--text-3); font-size: 12px; margin: 6px 0 10px; }
+.g2pr .editbar {
+  position: sticky; bottom: 0; display: flex; gap: 8px; flex-wrap: wrap;
+  padding: 10px 0 2px; margin-top: 4px;
+  background: linear-gradient(180deg, rgba(35,35,35,0), var(--surface) 30%);
+}
+.g2pr .tags { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 8px; }
+.g2pr .btns { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 10px; }
 `
 
 export async function mountPrompts(host?: HTMLElement) {
+  installTheme()
+
   const style = document.createElement('style')
   style.textContent = CSS
   document.head.appendChild(style)
 
   const root = document.createElement('div')
-  root.className = 'g2pr'
-  root.innerHTML = `<h3>Suggestion prompts</h3>
-    <div class="sub">The instruction sent with the transcript during a
-      recording. The active one is used; edits apply at the next
-      suggestion.</div>
-    <div class="eff">loading…</div>
-    <div class="body"></div>
-    <div class="btns"><button class="new">New prompt</button>
-      <span class="state"></span></div>`
+  root.className = 'g2-stack g2pr'
   ;(host ?? document.body).appendChild(root)
 
-  const eff = root.querySelector('.eff') as HTMLElement
-  const body = root.querySelector('.body') as HTMLElement
-  const state = root.querySelector('.state') as HTMLElement
+  const card = makeCard({
+    title: 'Suggestion prompts',
+    sub: 'Sent with the transcript during a recording',
+    icon: 'spark',
+    collapsible: true,
+    open: false,
+    memory: 'prompts',
+  })
+  const chip = document.createElement('span')
+  chip.className = 'chip mute'
+  chip.textContent = '—'
+  card.aside.appendChild(chip)
+
+  card.body.innerHTML = `
+    <div class="eff"><span>Sending</span><span class="who">loading…</span></div>
+    <div class="body"></div>
+    <div class="btns">
+      <button class="btn sm new" type="button">${icon('plus')}<span>New prompt</span></button>
+      <span class="state"></span>
+    </div>`
+  root.appendChild(card.root)
+
+  const effWho = card.body.querySelector('.eff .who') as HTMLElement
+  const body = card.body.querySelector('.body') as HTMLElement
+  const stateEl = card.body.querySelector('.state') as HTMLElement
+  const newBtn = card.body.querySelector('.new') as HTMLButtonElement
 
   const say = (m: string, err = false) => {
-    state.textContent = m
-    state.className = err ? 'state err' : 'state'
+    stateEl.textContent = m
+    stateEl.className = err ? 'state err' : 'state'
   }
 
   let store: Store = { active: '', prompts: [] }
@@ -118,11 +133,14 @@ export async function mountPrompts(host?: HTMLElement) {
 
   function paintEffective() {
     if (!store.effective) {
-      eff.textContent = ''
+      effWho.textContent = '(unknown)'
+      chip.textContent = '—'
+      chip.className = 'chip mute'
       return
     }
-    eff.textContent =
-      `Sending: ${store.effective.label} — ${store.effective.chars} chars`
+    effWho.textContent = `${store.effective.label} · ${store.effective.chars} chars`
+    chip.textContent = store.effective.label
+    chip.className = 'chip info'
   }
 
   // ------------------------------------------------------------- editor
@@ -131,15 +149,14 @@ export async function mountPrompts(host?: HTMLElement) {
     const isNew = p === null
     body.innerHTML = `
       <div class="lbl">Title</div>
-      <input class="t" type="text" maxlength="80"
-             placeholder="e.g. Meeting corrections">
+      <input class="inp t" type="text" maxlength="80" placeholder="e.g. Meeting corrections">
       <div class="lbl">Prompt</div>
-      <textarea class="x" spellcheck="false"></textarea>
+      <textarea class="inp x" spellcheck="false"></textarea>
       <div class="count"></div>
-      <div class="btns">
-        <button class="save primary">Save</button>
-        <button class="cancel">Cancel</button>
-        ${isNew ? '' : '<button class="del danger">Delete</button>'}
+      <div class="editbar">
+        <button class="btn primary save" type="button">${icon('check')}<span>Save</span></button>
+        <button class="btn ghost cancel" type="button">Cancel</button>
+        ${isNew ? '' : `<button class="btn danger del" type="button">${icon('trash')}<span>Delete</span></button>`}
       </div>`
 
     const t = body.querySelector('.t') as HTMLInputElement
@@ -149,10 +166,10 @@ export async function mountPrompts(host?: HTMLElement) {
     t.value = p?.title ?? ''
     x.value = p?.text ?? ''
 
-    // Length is shown because it is the one number that silently breaks
-    // things: the whole prompt is re-sent as prefill on EVERY attempt, and
-    // Ollama truncates past num_ctx without saying so. Roughly 4 chars per
-    // token against a 32768 context.
+    // Length is shown because it is the one number that silently breaks things:
+    // the whole prompt is re-sent as prefill on EVERY attempt, and Ollama
+    // truncates past num_ctx without saying so. Roughly 4 chars per token
+    // against a 32768 context.
     const paintCount = () => {
       count.textContent = `${x.value.length} chars (~${Math.round(
         x.value.length / 4,
@@ -196,7 +213,8 @@ export async function mountPrompts(host?: HTMLElement) {
         // evening of tuning gone.
         if (del.dataset.armed !== '1') {
           del.dataset.armed = '1'
-          del.textContent = 'Tap again to delete'
+          del.classList.add('armed')
+          del.innerHTML = `${icon('trash')}<span>Tap again to delete</span>`
           return
         }
         try {
@@ -216,10 +234,9 @@ export async function mountPrompts(host?: HTMLElement) {
 
   function renderList() {
     if (!store.prompts.length) {
-      body.innerHTML =
-        `<div class="row"><span class="meta">No prompts stored. The
-         gateway is falling back to SUGGEST_PROMPT from the environment
-         until you create one.</span></div>`
+      body.innerHTML = `<div class="empty">No prompts stored. The gateway is
+        falling back to SUGGEST_PROMPT from the environment until you create
+        one.</div>`
       return
     }
 
@@ -227,21 +244,20 @@ export async function mountPrompts(host?: HTMLElement) {
     for (const p of store.prompts) {
       const on = p.id === store.active
       const row = document.createElement('div')
-      row.className = on ? 'row on' : 'row'
+      row.className = on ? 'tile on' : 'tile'
       row.innerHTML = `
         <span class="ttl"></span>
         <span class="meta"></span>
+        <div class="tags">${on ? '<span class="chip ok">Active</span>' : ''}</div>
         <div class="btns">
-          ${on ? '<span class="badge">Active</span>'
-               : '<button class="use primary">Use this</button>'}
-          <button class="edit">Edit</button>
+          ${on ? '' : `<button class="btn sm primary use" type="button">${icon('check')}<span>Use this</span></button>`}
+          <button class="btn sm edit" type="button">${icon('edit')}<span>Edit</span></button>
         </div>`
 
-      // textContent, not innerHTML: a title is user text and goes in as
-      // text, never as markup.
+      // textContent, not innerHTML: a title is user text and goes in as text,
+      // never as markup.
       ;(row.querySelector('.ttl') as HTMLElement).textContent = p.title
-      ;(row.querySelector('.meta') as HTMLElement).textContent =
-        `${p.text.length} chars`
+      ;(row.querySelector('.meta') as HTMLElement).textContent = `${p.text.length} chars`
 
       const use = row.querySelector('.use') as HTMLButtonElement | null
       if (use) {
@@ -268,7 +284,6 @@ export async function mountPrompts(host?: HTMLElement) {
 
   function render() {
     paintEffective()
-    const newBtn = root.querySelector('.new') as HTMLButtonElement
     newBtn.disabled = editing !== ''
     if (editing === 'new') return renderEditor(null)
     if (editing) {
@@ -279,7 +294,7 @@ export async function mountPrompts(host?: HTMLElement) {
     renderList()
   }
 
-  ;(root.querySelector('.new') as HTMLButtonElement).onclick = () => {
+  newBtn.onclick = () => {
     editing = 'new'
     render()
   }
@@ -289,8 +304,13 @@ export async function mountPrompts(host?: HTMLElement) {
     render()
     say('')
   } catch (e) {
-    body.innerHTML = `<div class="err">Could not reach gateway: ${
-      (e as Error).message
-    }<br>Checked ${restBase()}/prompts</div>`
+    chip.textContent = 'Offline'
+    chip.className = 'chip bad'
+    effWho.textContent = '(gateway unreachable)'
+    body.innerHTML = `<div class="empty"><span class="err msg"></span><br>
+      <span class="mono url"></span></div>`
+    ;(body.querySelector('.msg') as HTMLElement).textContent =
+      `Could not reach gateway: ${(e as Error).message}`
+    ;(body.querySelector('.url') as HTMLElement).textContent = `${restBase()}/prompts`
   }
 }
