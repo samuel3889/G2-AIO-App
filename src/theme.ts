@@ -61,7 +61,18 @@ const CSS = `
   --font: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, system-ui, sans-serif;
   --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
 
-  --appbar-h: 50px;
+  /**
+   * Height of the in-page app bar (the "G2 / Live ... HOME - TAP FOR MENU"
+   * strip), NOT the host's native "Even Hub ASR" title bar above it.
+   *
+   * Was 50px, and the strip additionally added env(safe-area-inset-top) to
+   * both its height and its top padding - see .g2-appbar below. The host
+   * already draws its own title bar under the system status bar, so that
+   * inset was being paid twice: once by the host chrome, once here. The
+   * visible result was a tall dead band with the row pinned to its bottom.
+   * 38px is one 12px uppercase line plus 13px above and below.
+   */
+  --appbar-h: 38px;
 }
 
 * { -webkit-tap-highlight-color: transparent; }
@@ -79,29 +90,41 @@ body { display: flex; flex-direction: column; }
 
 /* ------------------------------------------------------------------ shell */
 
+/**
+ * The in-page app bar.
+ *
+ * NO env(safe-area-inset-top) here. This WebView is hosted below the Even Hub
+ * native title bar, which has already cleared the notch/status bar, so adding
+ * the inset again pushed the row down by the full status-bar height and left
+ * the band above it empty. If this page is ever loaded standalone (browser,
+ * fullscreen WebView) the row would sit under the system clock - put the inset
+ * back on <body> in that case, not here.
+ *
+ * gap/padding trimmed with the height so the row still reads as centred.
+ */
 .g2-appbar {
-  flex: 0 0 auto; display: flex; align-items: center; gap: 8px;
-  height: calc(var(--appbar-h) + env(safe-area-inset-top));
-  padding: env(safe-area-inset-top) 16px 0;
+  flex: 0 0 auto; display: flex; align-items: center; gap: 7px;
+  height: var(--appbar-h);
+  padding: 0 14px;
   background: linear-gradient(180deg, #272727, #1F1F1F);
   border-bottom: 1px solid var(--line-soft);
   position: relative; z-index: 4;
 }
 .g2-dot {
-  width: 8px; height: 8px; border-radius: 50%; flex: 0 0 auto;
+  width: 7px; height: 7px; border-radius: 50%; flex: 0 0 auto;
   background: var(--text-3); box-shadow: 0 0 0 3px rgba(255,255,255,.04);
   transition: background .2s var(--ease), box-shadow .2s var(--ease);
 }
 .g2-dot.ok  { background: var(--accent); box-shadow: 0 0 10px rgba(60,250,68,.55); }
 .g2-dot.bad { background: var(--danger); box-shadow: 0 0 10px rgba(255,69,58,.5); }
 .g2-brand {
-  font: 800 12px/1 var(--font); letter-spacing: .18em; color: var(--text-2);
+  font: 800 11px/1 var(--font); letter-spacing: .16em; color: var(--text-2);
 }
-.g2-sep   { color: var(--text-3); font-size: 12px; }
-.g2-crumb { font: 650 13px/1 var(--font); color: var(--text); }
+.g2-sep   { color: var(--text-3); font-size: 11px; }
+.g2-crumb { font: 650 12px/1 var(--font); color: var(--text); }
 .g2-appbar .spacer { flex: 1 1 auto; }
 .g2-conn {
-  font: 600 11px/1 var(--font); letter-spacing: .06em; text-transform: uppercase;
+  font: 600 10px/1 var(--font); letter-spacing: .06em; text-transform: uppercase;
   color: var(--text-3); white-space: nowrap; max-width: 44%;
   overflow: hidden; text-overflow: ellipsis;
 }
