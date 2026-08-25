@@ -68,6 +68,7 @@ const GROUPS: Group[] = [
       'hangover_ms',
       'preroll_ms',
       'min_rms',
+      'armed_min_rms',
       'min_voiced_ratio',
       'vad_aggressiveness',
       'min_utterance_ms',
