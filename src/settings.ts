@@ -15,16 +15,44 @@
  * WHAT CHANGED IN THIS PASS
  *  - Twenty-five sliders in one flat column is a wall. They are now sorted into
  *    collapsible sections whose open/closed state is remembered.
+ *  - Voice activity was nine of the twenty-seven sliders - a third of the panel
+ *    back in one card, which is the wall again in miniature. It splits along a
+ *    real seam rather than an arbitrary one: the level gates answer "is this
+ *    speech at all", the boundary values answer "where does this utterance
+ *    begin and end". Different questions, different units, tuned at different
+ *    times. Section ids changed with it ('voice' -> 'voice_level' and
+ *    'voice_timing'), so the remembered open/closed state for the old section
+ *    is orphaned under 'tune:voice' and both new sections start closed once.
  *  - THE GROUPING IS CLIENT-SIDE. tunables.py's TUNABLES entries carry
  *    key/label/help/env/type/min/max/step/default/unit and NO group field, so
  *    nothing here reads one. GROUPS below lists known keys by hand, and any key
  *    the server sends that is not listed falls into "Other" rather than
  *    vanishing — a new server-side tunable still appears without a phone build.
+ *    That safety net is also the trap: timer_alert_s was added to tunables.py
+ *    and silently sat in "Other" until someone noticed. Every key in tunables.py
+ *    as of this pass is now listed above; check this list when adding one.
  *  - Reset arms on the first tap and fires on the second. Note it restores the
  *    ENV defaults (tunables.py Settings.reset uses _env_defaults), which are the
  *    .env values where set and the schema defaults otherwise. The button says so
  *    rather than claiming "factory defaults".
  *  - A failed load now offers Retry instead of a dead end.
+ *
+ * MOUNTED MORE THAN ONCE, since the Translate tab landed. mountSettings()
+ * takes an options bag that filters the schema, so the same fetch, the same
+ * slider and the same debounced PUT serve both:
+ *
+ *   mountSettings(tabs.Live, { omit: ['translate_hold_s'] })
+ *   mountSettings(tabs.Translate, { only: ['translate_hold_s'], header: false })
+ *
+ * A tunable belongs beside the feature it tunes. Translation hold was three
+ * cards down a panel on a different tab from the thing it changes, which is
+ * how timer_alert_s sat unnoticed in "Other" for a while.
+ *
+ * The two instances do NOT share state: each fetches /settings and holds its
+ * own copy. That is a real limitation and an accepted one - the only value
+ * they both render would be one listed in `only` AND not in `omit`, which is
+ * a configuration mistake rather than a case to design for. Changes from
+ * either are written to the gateway and both re-read on the next app start.
  *
  * The gateway URL rule and the token live in api.ts. Endpoints used, all as
  * defined in routes_settings.py:
@@ -33,7 +61,26 @@
  *   POST /settings/reset   -> { values }
  */
 import { restBase, restUrl } from './api'
-import { installTheme, makeCard, icon } from './theme'
+import { installTheme, makeCard, icon, PANEL_ORDER } from './theme'
+
+export interface SettingsOptions {
+  /**
+   * Render ONLY these keys. Everything else in the schema is ignored, and a
+   * key listed here that the gateway does not send simply does not appear -
+   * so a panel pinned to a tunable that was later renamed goes empty rather
+   * than breaking the tab.
+   */
+  only?: string[]
+  /** Render everything EXCEPT these keys. Ignored when `only` is given. */
+  omit?: string[]
+  /**
+   * Show the "Tuning" header card with the Reset all button. Default true.
+   *
+   * False for a subset panel: "Reset all" there would reset every tunable in
+   * the app, from a card that appears to be about one slider.
+   */
+  header?: boolean
+}
 
 interface Tunable {
   key: string
@@ -60,17 +107,20 @@ interface Group {
  */
 const GROUPS: Group[] = [
   {
-    id: 'voice',
-    title: 'Voice activity',
-    sub: 'When an utterance starts and ends',
-    icon: 'waves',
+    id: 'voice_level',
+    title: 'What counts as speech',
+    sub: 'The loudness and voicedness gates',
+    icon: 'gauge',
+    keys: ['min_rms', 'armed_min_rms', 'min_voiced_ratio', 'vad_aggressiveness'],
+  },
+  {
+    id: 'voice_timing',
+    title: 'Utterance boundaries',
+    sub: 'Where an utterance starts, ends, and gets cut',
+    icon: 'span',
     keys: [
-      'hangover_ms',
       'preroll_ms',
-      'min_rms',
-      'armed_min_rms',
-      'min_voiced_ratio',
-      'vad_aggressiveness',
+      'hangover_ms',
       'min_utterance_ms',
       'max_utterance_ms',
       'hallucination_max_ms',
@@ -80,7 +130,7 @@ const GROUPS: Group[] = [
     id: 'speaker',
     title: 'Speaker separation',
     sub: 'Carving a recording into distinct voices',
-    icon: 'user',
+    icon: 'users',
     keys: ['speaker_min_ms', 'speaker_match', 'speaker_new', 'speaker_max', 'split_drop'],
   },
   {
@@ -111,6 +161,20 @@ const GROUPS: Group[] = [
     sub: 'How long clips stay on disk',
     icon: 'disc',
     keys: ['clip_retention_h'],
+  },
+  {
+    id: 'timers',
+    title: 'Timers',
+    sub: 'The full-screen alert when a timer ends',
+    icon: 'clock',
+    keys: ['timer_alert_s'],
+  },
+  {
+    id: 'translate',
+    title: 'Lens timing',
+    sub: 'How long a translated line stays up',
+    icon: 'clock',
+    keys: ['translate_hold_s'],
   },
 ]
 
@@ -165,8 +229,12 @@ const CSS = `
 .g2s .step:active { background: #383838; color: var(--text); }
 `
 
-export async function mountSettings(host?: HTMLElement) {
+export async function mountSettings(
+  host?: HTMLElement,
+  opts: SettingsOptions = {},
+) {
   installTheme()
+  const showHeader = opts.header !== false
 
   const style = document.createElement('style')
   style.textContent = CSS
@@ -174,6 +242,9 @@ export async function mountSettings(host?: HTMLElement) {
 
   const root = document.createElement('div')
   root.className = 'g2-stack g2s'
+  // The host is a flex column, so `order` decides where this stacks - not
+  // the order it was mounted in. Tuning goes last on whatever tab it is on.
+  root.style.order = String(PANEL_ORDER.tuning)
   ;(host ?? document.body).appendChild(root)
 
   // --- header card, always present ----------------------------------------
@@ -194,7 +265,11 @@ export async function mountSettings(host?: HTMLElement) {
       <button class="btn danger reset" type="button">${icon('reset')}<span>Reset all</span></button>
       <span class="state"></span>
     </div>`
-  root.appendChild(head.root)
+  // Built either way, appended only when wanted. Everything below writes to
+  // `badge` and `stateEl` unconditionally; leaving the card detached lets
+  // those writes be harmless no-ops rather than needing a null check at
+  // every call site.
+  if (showHeader) root.appendChild(head.root)
 
   const stateEl = head.body.querySelector('.state') as HTMLElement
   const resetBtn = head.body.querySelector('.reset') as HTMLButtonElement
@@ -216,7 +291,11 @@ export async function mountSettings(host?: HTMLElement) {
     const r = await fetch(restUrl('/settings'))
     if (!r.ok) throw new Error(`${r.status}`)
     const d = await r.json()
-    schema = d.schema
+    // Filtered HERE, once, rather than in bucket() and again in render():
+    // everything downstream then works on the schema this panel owns and
+    // needs no idea that a subset is possible. `values` is deliberately NOT
+    // filtered - it is only ever read by key.
+    schema = filterSchema(d.schema)
     values = d.values
   }
 
@@ -345,6 +424,24 @@ export async function mountSettings(host?: HTMLElement) {
   let painters: Array<() => void> = []
   let sectionCards: HTMLElement[] = []
 
+  /**
+   * Narrow the gateway's schema to what this panel is for.
+   *
+   * `only` wins over `omit` when both are given; that combination is a
+   * configuration mistake rather than a case worth resolving cleverly.
+   */
+  function filterSchema(all: Tunable[]): Tunable[] {
+    if (opts.only) {
+      const want = new Set(opts.only)
+      return all.filter(t => want.has(t.key))
+    }
+    if (opts.omit) {
+      const drop = new Set(opts.omit)
+      return all.filter(t => !drop.has(t.key))
+    }
+    return all
+  }
+
   /** Split the schema into GROUPS order, leftovers last, nothing dropped. */
   function bucket(): Array<{ g: Group; items: Tunable[] }> {
     const byKey = new Map(schema.map(t => [t.key, t]))
@@ -386,7 +483,10 @@ export async function mountSettings(host?: HTMLElement) {
         // First section open on a fresh install; after that the phone
         // remembers what you left open.
         open: i === 0,
-        memory: `tune:${g.id}`,
+        // A subset panel gets its OWN memory key. Otherwise the Translation
+        // card on the Translate tab and the same-named card in the full
+        // panel would fold each other, which reads as the app forgetting.
+        memory: opts.only ? `tune:${g.id}:sub` : `tune:${g.id}`,
       })
 
       const count = document.createElement('span')

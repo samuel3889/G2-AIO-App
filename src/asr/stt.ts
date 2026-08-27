@@ -6,10 +6,12 @@
  *
  * Wire format out: raw 16 kHz mono s16le PCM binary frames, plus JSON
  *                  control frames {cmd:"flush"|"reset"|"endconvo"|
- *                  "session_start"|"session_stop"|"session_status"}.
+ *                  "session_start"|"session_stop"|"session_status"|
+ *                  "translate_start"|"translate_stop"|"translate_status"}.
  * Wire format in:  JSON - {type:"ready"|"speech"|"partial"|"final"|"wake"|
  *                          "question"|"thinking"|"answer"|"convo"|
- *                          "session"|"summary"|"error", ...}
+ *                          "session"|"summary"|"timer"|"translate"|
+ *                          "translation"|"error", ...}
  *
  * Env (in .env.local):
  *   VITE_GATEWAY_URL=wss://g2gateway.sams-server.duckdns.org:50443/ws/stt
@@ -22,6 +24,70 @@ export interface SessionState {
   utterances: number
   /** Only present on the frame sent when a session stops. */
   summarizing?: boolean
+}
+
+/**
+ * Translate MODE state, from {"type":"translate"}.
+ *
+ * `a` is the LEFT language and `b` the RIGHT one. The order is load bearing
+ * and is the ONLY thing that decides which direction reaches the lens - see
+ * TranslationLine.lens. Swapping them is how the wearer reverses it.
+ *
+ * Both are null when inactive, rather than retaining the last pair. The
+ * gateway holds this per WebSocket, so a reconnect genuinely comes back with
+ * translation off, and a remembered pair here would misrepresent that.
+ */
+export interface TranslateState {
+  active: boolean
+  a: string | null
+  b: string | null
+  /** Display names, e.g. "Español". Null when inactive. */
+  aNative: string | null
+  bNative: string | null
+  /** Only present when a translate_start was rejected. */
+  error?: string
+}
+
+/**
+ * One translated utterance, from {"type":"translation"}.
+ *
+ * NOT a caption. This never touches `finalText` and never reaches
+ * onResult() - a translation is machine text about what someone said, and
+ * putting it in the caption buffer would make it indistinguishable from
+ * the transcript, exactly as the 'suggest' frame must not.
+ *
+ * `translated` is false when the gateway detected a language outside the
+ * pair. In that case only `sourceText` and `detected` are meaningful and
+ * everything else is undefined: there is nothing to show but what was heard.
+ * The phone should grey the line rather than hide it, so a third language in
+ * the room reads as "ignored" and not as "the glasses stopped working".
+ *
+ * `lens` is decided by the GATEWAY, not here. The list and the lens are drawn
+ * from this one frame, and a client that re-derived the direction itself
+ * could disagree with the server after a pair swap only one of them had
+ * processed.
+ */
+export interface TranslationLine {
+  seq: number
+  translated: boolean
+  /** What was actually said, in the language it was said in. */
+  sourceText: string
+  /** The translation. Empty when translated is false. */
+  text: string
+  /** Our language codes, e.g. "es". Empty when translated is false. */
+  from: string
+  to: string
+  /** Display names for the two above. */
+  fromNative: string
+  toNative: string
+  /** The raw code Whisper reported, which may be outside the pair. */
+  detected: string | null
+  /** True when this line is the one the lens should show. */
+  lens: boolean
+  /** How long the lens should hold it. Undefined = client default. */
+  holdMs?: number
+  sttMs: number
+  translateMs: number
 }
 
 export interface SttHandle {
@@ -48,6 +114,24 @@ export interface SttHandle {
    * keeps the authoritative transcript, so nothing is lost by clearing here.
    */
   clearTranscript(): void
+  /**
+   * Enter translate mode with a language pair.
+   *
+   * `a` is the LEFT language and `b` the RIGHT one, as our internal codes
+   * ("en", "es", "ru", "ja"). The gateway validates the pair and answers
+   * with a 'translate' frame either way - it does NOT silently accept a
+   * language it cannot handle, so onTranslate() is where the result of this
+   * call shows up, not the return value.
+   *
+   * While translate mode is on, the wake word and the assistant are
+   * bypassed server-side. Calling this does not stop a recording; the two
+   * are independent, exactly as sessions and conversations are.
+   */
+  startTranslate(a: string, b: string): void
+  /** Leave translate mode. Captions and the wake word resume. */
+  stopTranslate(): void
+  /** Ask the gateway to restate translate mode (used after a reconnect). */
+  translateStatus(): void
 }
 
 export interface SttResult {
@@ -138,6 +222,65 @@ export interface SttHooks {
    * WebView reload.
    */
   onSuggest?: (tag: string, text: string, holdMs?: number) => void
+  /**
+   * A timer command from the gateway, from {"type":"timer"}.
+   *
+   * NOT part of the assistant exchange, even though it is always caused by
+   * one. The gateway sends this frame and then an ordinary 'answer' frame
+   * carrying the confirmation, so the box the wake word opened resolves and
+   * dismisses itself on ANSWER_HOLD_MS like any other reply. This hook is
+   * only the COMMAND half.
+   *
+   * Deliberately not routed through onResult() or showOverlay(), for the
+   * same reason 'suggest' is not: those feed the caption buffer, and a
+   * confirmation that went that way would be indistinguishable from
+   * something a person in the room said.
+   *
+   * NOT gated on `overlay`. The countdown lives in the status strip, which
+   * is on every page including the assistant box, so there is no page state
+   * that makes this write pointless — unlike a suggestion, which main.ts has
+   * to hold and bake into a later rebuild.
+   */
+  onTimer?: (cmd: TimerCommand) => void
+  /**
+   * Translate mode turned on or off, or a start was rejected.
+   *
+   * Fires on every translate_start, translate_stop and translate_status,
+   * and on reconnect via the translate_status this module sends itself. The
+   * frame always carries the WHOLE state rather than a delta, so a consumer
+   * that missed one recovers on the next instead of reconciling.
+   */
+  onTranslate?: (s: TranslateState) => void
+  /**
+   * One utterance was translated, from {"type":"translation"}.
+   *
+   * Deliberately NOT routed through onResult() or showOverlay(), for the
+   * same reason 'suggest' is not: those feed the caption buffer, and a
+   * translation that went that way would be recorded as though a person in
+   * the room had said it in that language.
+   *
+   * Fires for out-of-pair detections too, with `translated` false. Filtering
+   * those out is the consumer's decision, not this module's.
+   */
+  onTranslation?: (line: TranslationLine) => void
+}
+
+/**
+ * The command half of a {"type":"timer"} frame.
+ *
+ * `durationS` is a DURATION, never a deadline, and that is deliberate on the
+ * gateway's side: the Unraid clock and the phone clock are not synchronised
+ * by anything in this stack, so the client anchors the countdown on its own
+ * Date.now() when the frame lands.
+ *
+ * Everything but `action` is optional because a cancel carries none of it.
+ */
+export interface TimerCommand {
+  action: 'start' | 'cancel'
+  title?: string
+  durationS?: number
+  /** Seconds the full-screen alert box holds. Undefined = client default. */
+  alertS?: number
 }
 
 const GATEWAY_URL = import.meta.env.VITE_GATEWAY_URL as string
@@ -264,6 +407,14 @@ export function startSttStream(
   // frame does not repeat it.
   let assistantQuestion = ''
 
+  // Translate mode, mirrored from the gateway's frames and never set
+  // locally. startTranslate() sends a command and waits for the answer
+  // rather than assuming it worked: the gateway rejects an unsupported or
+  // same-language pair, and a client that had already flipped its own flag
+  // would show translate mode running while the server was still
+  // captioning.
+  let translating = false
+
   function emitAssistant(
     phase: AssistantState['phase'],
     answer = '',
@@ -354,6 +505,11 @@ export function startSttStream(
       // this will report inactive after a drop - which is the truth, and
       // better than a phone UI still claiming to be recording.
       sendCmd('session_status')
+      // Same reasoning: a reconnect gets a FRESH gateway handler with
+      // translate_pair back at None, so the phone has to be told rather
+      // than keeping its own last known pair. This is also what clears
+      // `translating` after a drop, with no special case in onclose.
+      sendCmd('translate_status')
     }
 
     ws.onmessage = ev => {
@@ -379,7 +535,12 @@ export function startSttStream(
           // lens empty for the ~500ms until the 'final' arrives — a visible
           // flicker on every single utterance. The 'final' case clears the
           // interim, which is the correct moment for it.
-          if (overlay === null && msg.active) {
+          //
+          // Also suppressed in translate mode. The gateway stops sending
+          // partials there, but 'speech' still arrives - it comes from the
+          // endpointer, not Whisper - and a lone "..." with no text ever
+          // following it reads as a hang.
+          if (overlay === null && !translating && msg.active) {
             onResult({ finalText, interimText: ' ...' })
             hooks.onPartial?.('…')
           }
@@ -401,6 +562,11 @@ export function startSttStream(
           break
 
         case 'final': {
+          // Not reachable in translate mode - run_translate() returns
+          // before the gateway ever builds a 'final' - but left ungated on
+          // purpose. If one did arrive it would be a real transcript line
+          // and belongs in the buffer; dropping it silently would hide a
+          // server-side bug rather than surface it.
           finalText = `${finalText} ${msg.text}`.trim()
           if (finalText.length > MAX_CHARS) {
             finalText = finalText.slice(-MAX_CHARS)
@@ -458,6 +624,30 @@ export function startSttStream(
             msg.text,
             typeof msg.hold_ms === 'number' ? msg.hold_ms : undefined,
           )
+          break
+
+        case 'timer':
+          // Command only. The confirmation the wearer reads arrives
+          // separately as an ordinary 'answer' frame, immediately after
+          // this one — the gateway sends the command first so the countdown
+          // is already running when the box describing it appears.
+          //
+          // The fields are passed through UNVALIDATED. Clamping and the
+          // default both live in timer.ts's resolveAlertMs() and
+          // startTimer(), so there is one place that decides what a
+          // duration and a hold may be; this module's job is to hand the
+          // frame's fields to the hook, not to police them.
+          console.log(
+            `[stt] timer ${msg.action} title=${msg.title ?? '-'} ` +
+              `duration=${msg.duration_s ?? '-'}s alert=${msg.alert_s ?? 'default'}s`,
+          )
+          hooks.onTimer?.({
+            action: msg.action === 'cancel' ? 'cancel' : 'start',
+            title: typeof msg.title === 'string' ? msg.title : undefined,
+            durationS:
+              typeof msg.duration_s === 'number' ? msg.duration_s : undefined,
+            alertS: typeof msg.alert_s === 'number' ? msg.alert_s : undefined,
+          })
           break
 
         case 'wake':
@@ -531,6 +721,67 @@ export function startSttStream(
               closeAssistant('answer timeout')
             }, ANSWER_HOLD_MS)
           }
+          break
+
+        case 'translate':
+          // Mode state. The ONLY writer of `translating`, which is why
+          // startTranslate() below does not touch it.
+          translating = !!msg.active
+          if (msg.error) {
+            console.warn(`[stt] translate rejected: ${msg.error}`)
+          } else {
+            console.log(
+              `[stt] translate ${msg.active ? `${msg.a} -> ${msg.b}` : 'off'}`,
+            )
+          }
+          hooks.onTranslate?.({
+            active: !!msg.active,
+            a: msg.a ?? null,
+            b: msg.b ?? null,
+            aNative: msg.a_native ?? null,
+            bNative: msg.b_native ?? null,
+            error: typeof msg.error === 'string' ? msg.error : undefined,
+          })
+          break
+
+        case 'translation':
+          // One translated utterance. Never written to `finalText` and
+          // never passed to onResult(): see TranslationLine.
+          //
+          // NOT gated on `overlay`. Like 'suggest', this does not repaint
+          // the lens by itself - main.ts decides that - so a translation
+          // that lands while some box is up is handed over rather than
+          // lost.
+          if (msg.translated) {
+            console.log(
+              `[stt] translate seq=${msg.seq} ${msg.from}->${msg.to} ` +
+                `(stt ${msg.stt_ms}ms + tr ${msg.translate_ms}ms) ` +
+                `lens=${msg.lens}: ${msg.text}`,
+            )
+          } else {
+            console.log(
+              `[stt] translate seq=${msg.seq} skipped, detected ` +
+                `${msg.detected} outside pair: ${msg.source_text}`,
+            )
+          }
+          // hold_ms is passed through UNVALIDATED, same rule as 'suggest'
+          // and 'timer': clamping and the fallback belong in the module
+          // that owns the lens, so one place decides what a hold may be.
+          hooks.onTranslation?.({
+            seq: msg.seq,
+            translated: !!msg.translated,
+            sourceText: msg.source_text ?? '',
+            text: msg.text ?? '',
+            from: msg.from ?? '',
+            to: msg.to ?? '',
+            fromNative: msg.from_native ?? '',
+            toNative: msg.to_native ?? '',
+            detected: msg.detected ?? null,
+            lens: !!msg.lens,
+            holdMs: typeof msg.hold_ms === 'number' ? msg.hold_ms : undefined,
+            sttMs: msg.stt_ms ?? 0,
+            translateMs: msg.translate_ms ?? 0,
+          })
           break
 
         case 'session':
@@ -625,6 +876,25 @@ export function startSttStream(
 
     sessionStatus() {
       sendCmd('session_status')
+    },
+
+    startTranslate(a: string, b: string) {
+      // Any exchange on screen is over: translate mode bypasses the
+      // assistant server-side, so a box left up would never resolve and its
+      // follow-up window would never be closed by anything.
+      closeAssistant('translate started')
+      // `translating` is deliberately NOT set here - the gateway's
+      // 'translate' frame is what sets it, so a rejected pair cannot leave
+      // this client believing it is translating.
+      sendCmd('translate_start', { a, b })
+    },
+
+    stopTranslate() {
+      sendCmd('translate_stop')
+    },
+
+    translateStatus() {
+      sendCmd('translate_status')
     },
 
     clearTranscript() {

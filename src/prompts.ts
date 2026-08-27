@@ -24,6 +24,9 @@
  *    reading the body.
  *  - The editor's Save/Cancel/Delete bar sticks to the bottom of the editor, so
  *    a 46vh textarea does not push Save off the screen.
+ *  - "Sending" shows the prompt's TITLE and length, not the gateway's raw
+ *    `effective.label` — that label leads with the internal id (p1787505227697)
+ *    because it is also a log line. See effectiveTitle().
  *
  * Endpoints used, all as defined in routes_prompts.py:
  *   GET    /prompts               -> { active, prompts, effective }
@@ -33,7 +36,7 @@
  *   DELETE /prompts/{id}
  */
 import { restBase, restUrl } from './api'
-import { installTheme, makeCard, icon } from './theme'
+import { installTheme, makeCard, icon, PANEL_ORDER } from './theme'
 
 interface StoredPrompt {
   id: string
@@ -76,6 +79,9 @@ export async function mountPrompts(host?: HTMLElement) {
 
   const root = document.createElement('div')
   root.className = 'g2-stack g2pr'
+  // Last section in the Conversations tab: this is configuration that shapes a
+  // future recording, not something touched during one. See PANEL_ORDER.
+  root.style.order = String(PANEL_ORDER.prompts)
   ;(host ?? document.body).appendChild(root)
 
   const card = makeCard({
@@ -131,6 +137,35 @@ export async function mountPrompts(host?: HTMLElement) {
     store = await call('/prompts')
   }
 
+  /**
+   * Human name of the prompt the gateway would send right now.
+   *
+   * NOT `store.effective.label`. That string is built in prompts.py as
+   * `f"{p['id']} {p['title']!r}"` — id first — because the same value is what
+   * the suggester writes to its log lines, where an id is the half that
+   * matters. On screen it is 14 characters of noise in front of the answer,
+   * so the title is resolved from the store the response already carries
+   * instead of being parsed back out of the label.
+   *
+   * THE FALLBACK MIRRORS THE GATEWAY, deliberately. PromptStore.active_prompt()
+   * is `self.get(self.active) or self.prompts[0]`: a stale active pointer
+   * degrades to the first prompt rather than to silence. Resolving only by
+   * `store.active` here would print '(unknown)' for a case where the gateway
+   * is happily sending prompts[0], which is a worse lie than the id was.
+   *
+   * Null when the store is empty — the env-seed case, which has no title to
+   * show and whose label ('env SUGGEST_PROMPT') carries no id anyway.
+   */
+  function effectiveTitle(): string | null {
+    const p = store.prompts.find(q => q.id === store.active) ?? store.prompts[0]
+    return p ? p.title : null
+  }
+
+  /** The header chip is a few centimetres wide; a 80-char title is not. */
+  function ellipsis(s: string, max: number): string {
+    return s.length <= max ? s : `${s.slice(0, max - 1).trimEnd()}…`
+  }
+
   function paintEffective() {
     if (!store.effective) {
       effWho.textContent = '(unknown)'
@@ -138,8 +173,11 @@ export async function mountPrompts(host?: HTMLElement) {
       chip.className = 'chip mute'
       return
     }
-    effWho.textContent = `${store.effective.label} · ${store.effective.chars} chars`
-    chip.textContent = store.effective.label
+    // Empty store: the gateway is falling back to the env seed, and its label
+    // is then the whole answer to "what is being sent", so it is shown as-is.
+    const who = effectiveTitle() ?? store.effective.label
+    effWho.textContent = `${who} · ${store.effective.chars} chars`
+    chip.textContent = ellipsis(who, 18)
     chip.className = 'chip info'
   }
 

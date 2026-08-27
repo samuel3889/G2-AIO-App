@@ -23,6 +23,19 @@
  * the session starts at 0. Verified against the live endpoint, which is why
  * seeking works with no offset arithmetic.
  *
+ * WHERE THIS LIVES NOW
+ * Review is a collapsible SECTION of the Conversations tab, not a tab of its
+ * own. It is the last step of one job — record, read back, check who said what
+ * — and promoting it to a peer of Live made the nav read as three unrelated
+ * places. The panel's internals are unchanged; mountReview() just wraps the
+ * existing .g2r root in a makeCard().
+ *
+ * Two behaviours ride on the fold, and both used to ride on the tab:
+ *   - the session list is NOT fetched until the section is first opened, so a
+ *     folded Review costs nothing at startup
+ *   - closing the section stops playback, the same way leaving the tab did.
+ *     `hidden` never stopped audio by itself and neither does a fold.
+ *
  * No Even Hub SDK calls. DOM, fetch, and <audio> only.
  *
  * Endpoints used, all verified against the running gateway:
@@ -54,6 +67,7 @@
  */
 import { restBase, restUrl } from './api'
 import { TAB_HIDE } from './tabs'
+import { makeCard, PANEL_ORDER } from './theme'
 
 interface Segment {
   start_ms: number
@@ -100,9 +114,10 @@ interface SessionRow {
 const SPEAKER_MIN_MS = 2500
 
 const CSS = `
-.g2r { font: 14px/1.4 system-ui, sans-serif; padding: 12px; max-width: 560px;
-       margin: 12px auto; background: #111; color: #eee; border-radius: 10px; }
-.g2r h3 { margin: 0 0 4px; font-size: 15px; }
+/* FLAT. The card built in mountReview() draws the surface, border and padding
+   now; a second set here would nest one card inside another. */
+.g2r { font: 14px/1.4 system-ui, sans-serif; padding: 0; margin: 0;
+       max-width: none; background: transparent; color: #eee; }
 .g2r .sub { color: #888; font-size: 12px; margin-bottom: 12px; }
 .g2r .bar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap;
             margin-bottom: 10px; }
@@ -230,7 +245,7 @@ export function mountReview(host?: HTMLElement) {
 
   const root = document.createElement('div')
   root.className = 'g2r'
-  root.innerHTML = `<h3>Review</h3>
+  root.innerHTML = `
     <div class="sub">Retained clips, worst-first. Tap ▶ for the whole clip, or a segment to hear just that piece.</div>
     <div class="bar">
       <select class="pick"><option>loading…</option></select>
@@ -247,7 +262,34 @@ export function mountReview(host?: HTMLElement) {
     <div class="stats"></div>
     <div class="legend" hidden></div>
     <div class="list">Pick a session.</div>`
-  ;(host ?? document.body).appendChild(root)
+  // Deferred until the section is first opened. A folded Review must not fire
+  // GET /sessions on every app start.
+  let loaded = false
+
+  const card = makeCard({
+    title: 'Review',
+    sub: 'Play clips back and name voices',
+    icon: 'headset',
+    collapsible: true,
+    open: false,
+    memory: 'review',
+    onToggle: (open: boolean) => {
+      if (!open) {
+        // Same reason the TAB_HIDE handler below exists: audio that keeps
+        // playing out of a panel you have folded away is a bug that is very
+        // hard to attribute later.
+        stopAudio('stopped — section collapsed')
+        return
+      }
+      if (!loaded) {
+        loaded = true
+        void loadSessions()
+      }
+    },
+  })
+  card.body.appendChild(root)
+  card.root.style.order = String(PANEL_ORDER.review)
+  ;(host ?? document.body).appendChild(card.root)
 
   const pick = root.querySelector('.pick') as HTMLSelectElement
   const needBtn = root.querySelector('.f-need') as HTMLButtonElement
@@ -923,5 +965,10 @@ export function mountReview(host?: HTMLElement) {
   allBtn.onclick = () => setFilter(true)
   ;(root.querySelector('.refresh') as HTMLButtonElement).onclick = () => void loadSessions()
 
-  void loadSessions()
+  // Only when the remembered state has it already open. Otherwise the first
+  // unfold does it, via onToggle above.
+  if (card.isOpen()) {
+    loaded = true
+    void loadSessions()
+  }
 }

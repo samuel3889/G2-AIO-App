@@ -12,6 +12,8 @@
  *   - the app shell classes used by tabs.ts (.g2-appbar / .g2-scroll / .g2-nav)
  *   - reusable components: .card, .btn, .chip, .tile, .inp, .slider
  *   - makeCard(): the collapsible section every panel is built from
+ *   - PANEL_ORDER: flex `order` values, so a host's sections stack in a fixed
+ *     order no matter what order the panels happened to mount in
  *   - icon(): inline SVG, stroke: currentColor, so icons inherit chip/button colour
  *
  * COLOURS are the Even Realities dark surfaces already used in the old ui.ts
@@ -19,10 +21,14 @@
  * and #FF453A for danger. Nothing else is allowed to be a brand colour.
  *
  * THE REVIEW COMPAT BLOCK at the bottom is deliberate. review.ts still injects
- * its own .g2r stylesheet and is NOT rewritten in this pass; the overrides are
+ * its own .g2r stylesheet and its internals are NOT rewritten; the overrides are
  * scoped `.g2p .g2r` (specificity 0,2,0) so they beat review's own `.g2r` rules
- * (0,1,0) regardless of which <style> is appended last. Delete that block when
- * review.ts is converted to cards.
+ * (0,1,0) regardless of which <style> is appended last.
+ *
+ * The .g2r root itself is now FLAT — no background, border, radius, padding or
+ * margin — because review.ts wraps it in a real makeCard(). Leaving the old
+ * slab styling on it would draw a second card inside the first, which is the
+ * exact double-bordered look this file exists to prevent.
  *
  * No Even Hub SDK calls here. DOM only.
  */
@@ -282,12 +288,11 @@ textarea.inp { min-height: 44vh; resize: vertical; white-space: pre-wrap; }
 /* --------------------------------------------- review.ts compatibility skin
    Scoped as .g2p .g2r so it wins on specificity, not on style-tag order.     */
 .g2p .g2r {
-  background: var(--surface); color: var(--text); font-family: var(--font);
-  border: 1px solid var(--line-soft); border-radius: var(--r3);
-  margin: 0; padding: 16px;
+  background: transparent; color: var(--text); font-family: var(--font);
+  border: 0; border-radius: 0; margin: 0; padding: 0; max-width: none;
 }
-.g2p .g2r h3  { font: 650 15px/1.25 var(--font); margin: 0 0 4px; }
-.g2p .g2r .sub, .g2p .g2r .stats { color: var(--text-3); }
+.g2p .g2r .sub  { font-size: 12px; color: var(--text-3); margin-bottom: 12px; }
+.g2p .g2r .stats { color: var(--text-3); }
 .g2p .g2r button {
   min-height: 40px; border-radius: 10px; font-weight: 650;
   background: var(--surface-2); color: var(--text); border: 1px solid var(--line);
@@ -332,6 +337,10 @@ export function installTheme(): void {
 const ICONS: Record<string, string> = {
   waves:    '<path d="M2 12h2m3-6v12m4-9v6m4-10v14m4-9v4m3-3h2"/>',
   chat:     '<path d="M21 12a8 8 0 0 1-8 8H7l-4 3V12a8 8 0 0 1 8-8h2a8 8 0 0 1 8 8Z"/>',
+  // Lidded box with a pull slot: stored conversations, as distinct from the
+  // `chat` bubble the Conversations TAB uses. A section must not wear its own
+  // parent's icon or the nesting stops reading.
+  archive:  '<rect x="3" y="4" width="18" height="4.5" rx="1.4"/><path d="M5 8.5V19a1.5 1.5 0 0 0 1.5 1.5h11A1.5 1.5 0 0 0 19 19V8.5"/><path d="M10 12.5h4"/>',
   headset:  '<path d="M4 14v-2a8 8 0 0 1 16 0v2"/><rect x="2" y="14" width="5" height="7" rx="2"/><rect x="17" y="14" width="5" height="7" rx="2"/>',
   sliders:  '<path d="M4 6h9m4 0h3M4 12h3m4 0h9M4 18h9m4 0h3"/><circle cx="15" cy="6" r="2"/><circle cx="9" cy="12" r="2"/><circle cx="15" cy="18" r="2"/>',
   chevron:  '<path d="m9 6 6 6-6 6"/>',
@@ -349,6 +358,19 @@ const ICONS: Record<string, string> = {
   disc:     '<circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="2.5"/>',
   mic:      '<rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3"/>',
   reset:    '<path d="M3 12a9 9 0 1 0 2.6-6.4"/><path d="M3 4v5h5"/>',
+
+  // Added for the tuning panel's section headers. Each one has to read at
+  // 18px inside a card badge, so they are deliberately 2-3 strokes and no
+  // more - detail at this size turns into a smudge.
+
+  // Dial with a needle: a threshold something is measured against.
+  gauge:    '<path d="M4 18a8 8 0 1 1 16 0"/><path d="m12 18 4.5-6"/><circle cx="12" cy="18" r="1.4"/>',
+  // Measured span: two end posts with a double-headed arrow between them.
+  span:     '<path d="M4 5v14M20 5v14"/><path d="M7 12h10"/><path d="m9.5 9.5 3 2.5-3 2.5M14.5 9.5l3 2.5-3 2.5"/>',
+  // Two heads, one behind the other: telling people apart, not one person.
+  users:    '<circle cx="9" cy="8" r="3.4"/><path d="M2.5 20a6.5 6.5 0 0 1 13 0"/><path d="M16 4.9a3.4 3.4 0 0 1 0 6.2"/><path d="M17.5 14.4A6.5 6.5 0 0 1 21.5 20"/>',
+  // Clock face with hands: a duration on the wall, not on disk.
+  clock:    '<circle cx="12" cy="12" r="9"/><path d="M12 6.5V12l3.5 2.2"/>',
 }
 
 /**
@@ -377,6 +399,14 @@ export interface CardOptions {
   open?: boolean
   /** Remember open/closed under this key across app restarts. */
   memory?: string
+  /**
+   * Fired when the card is folded or unfolded — by tap or by setOpen(), but
+   * NOT for the initial state, which the caller already knows via isOpen().
+   *
+   * This is what lets a section behave like a tab used to: review.ts defers
+   * its first fetch until it is opened, and stops audio when it is closed.
+   */
+  onToggle?: (open: boolean) => void
 }
 
 export interface CardHandle {
@@ -400,6 +430,37 @@ function recall(key: string): boolean | null {
     return v === null ? null : v === '1'
   } catch { return null }
 }
+
+/**
+ * Vertical order of the sections inside a tab host.
+ *
+ * A host (.g2p) is a flex column, so `order` decides the stacking — NOT the
+ * sequence the panels were mounted in. That distinction matters: main.ts must
+ * mount review.ts before it awaits the Even Hub bridge (so the panel still
+ * exists when there are no glasses to talk to) but must mount sessions.ts
+ * after, because the record buttons need the STT socket. Mount order and read
+ * order are therefore not the same thing, and this is the read order.
+ *
+ * Gaps of 10 so a section can be slipped in between without renumbering.
+ */
+export const PANEL_ORDER = {
+  /** Pair picker + live lines (translate.ts), on the Translate tab. */
+  translate: 5,
+  /** Recording + Saved conversations (sessions.ts). */
+  sessions: 10,
+  /** Review (review.ts). */
+  review: 20,
+  /** Suggestion prompts (prompts.ts). */
+  prompts: 30,
+  /**
+   * Tuning sliders (settings.ts). LAST on whatever tab they appear on.
+   *
+   * settings.ts can now be mounted more than once - the whole set on Live,
+   * and a single-slider subset on Translate - so it needs an order value of
+   * its own rather than relying on being mounted first.
+   */
+  tuning: 40,
+} as const
 
 /**
  * Build a card. Collapsible cards are the unit of organisation on the phone:
@@ -452,6 +513,7 @@ export function makeCard(o: CardOptions): CardHandle {
       open = !open
       apply()
       if (o.memory) remember(o.memory, open)
+      o.onToggle?.(open)
     })
   }
 
@@ -460,7 +522,12 @@ export function makeCard(o: CardOptions): CardHandle {
     body,
     aside,
     setSub: (text: string) => { sub.textContent = text },
-    setOpen: (v: boolean) => { open = v; apply(); if (o.memory) remember(o.memory, v) },
+    setOpen: (v: boolean) => {
+      open = v
+      apply()
+      if (o.memory) remember(o.memory, v)
+      o.onToggle?.(v)
+    },
     isOpen: () => open,
   }
 }

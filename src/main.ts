@@ -5,7 +5,13 @@ import {
   TextContainerUpgrade,
   OsEventTypeList,
 } from '@evenrealities/even_hub_sdk'
-import { startSttStream, type SessionState, type AssistantState } from './asr/stt'
+import {
+  startSttStream,
+  type SessionState,
+  type AssistantState,
+  type TranslateState,
+  type TranslationLine,
+} from './asr/stt'
 import { mountUi, setStatus, setTranscript } from './ui'
 import {
   captionColumns,
@@ -23,6 +29,7 @@ import {
   TRANSCRIPT_NAME,
   showTranscriptPage,
   showHomePage,
+  showAlertPage,
   homeContainer,
 } from './pages'
 import { mountSettings } from './settings'
@@ -36,6 +43,13 @@ import {
 import { assistantBox, OVERLAY_Q_ID, OVERLAY_NAME } from './overlay'
 import { showMenuPage, MENU_ACTIONS, menuLabels, type MenuAction } from './menu'
 import { mountSessions, setLiveSession, refreshSessions } from './sessions'
+import {
+  mountTranslate,
+  setTranslateState,
+  pushTranslation,
+  lastPair,
+} from './translate'
+import { showTranslatePage, readMs, type LensTranslation } from './translatepage'
 import { mountTabs } from './tabs'
 import { mountReview } from './review'
 import { mountPrompts } from './prompts'
@@ -44,20 +58,42 @@ import {
   setDeviceStatus,
   setGlassesSn,
   startStatusUpdates,
+  setStripOnPage,
 } from './statusbar'
+import {
+  onTimerExpired,
+  startTimer,
+  cancelTimer,
+  type TimerState,
+} from './timer'
 
-// Phone UI: one tab bar, three hosts. Every panel is mounted ONCE, here at
+// Phone UI: one tab bar, TWO hosts. Every panel is mounted ONCE, here at
 // startup, and only shown/hidden afterwards — mountSessions() registers
 // callbacks that setLiveSession() drives, so remounting on tab switch would
 // leave those writing into detached DOM.
 //
+// Review is no longer a tab. It is a collapsible section of Conversations,
+// alongside Recording, Saved conversations and Suggestion prompts — four
+// steps of one job rather than a nav entry each. Their vertical order comes
+// from PANEL_ORDER in theme.ts, NOT from the order they are mounted in here:
+// mountReview() has to run before the bridge await below (so Review works
+// with no glasses attached) while mountSessions() has to run after it (its
+// buttons need the STT socket).
+//
 // mountUi() still owns #app and is NOT moved into a host: it replaces #app's
 // innerHTML wholesale, which would destroy anything mounted inside it.
-const tabs = mountTabs(['Live', 'Conversations', 'Review'])
+//
+// Translate is its OWN tab rather than a section of Conversations, unlike
+// Review. The two are different modes of the device - the gateway refuses to
+// caption and translate at once - so putting them in one scrolling column
+// would suggest they compose.
+const tabs = mountTabs(['Live', 'Conversations', 'Translate'])
 
-void mountSettings(tabs.Live)
+// The full tuning panel, minus anything that belongs beside its own feature.
+// translate_hold_s is mounted on the Translate tab instead, further down.
+void mountSettings(tabs.Live, { omit: ['translate_hold_s'] })
 mountUi()
-mountReview(tabs.Review)
+mountReview(tabs.Conversations)
 
 const API_KEY = import.meta.env.VITE_STT_API_KEY as string
 if (!API_KEY) {
@@ -207,8 +243,97 @@ let currentText = INITIAL_CONTENT
 // file is already written as `pageMode !== 'transcript'`, so adding it here is
 // what makes partials, finals, speaker names and suggestions all stay off the
 // lens while home is up, without touching any of them.
-type PageMode = 'home' | 'transcript' | 'list' | 'menu'
+//
+// 'alert' is the full-screen timer box. It is a page mode rather than a flag
+// because every render guard in this file is already written as
+// `pageMode !== 'transcript'` — so naming it here is what suppresses
+// partials, finals, speaker names and suggestions for its duration, with no
+// edit to any of them.
+//
+// 'translate' is the two-box translate page. Like 'alert' it is a page mode
+// rather than a flag, so that every render guard already written as
+// `pageMode !== 'transcript'` suppresses partials, finals, speaker names and
+// suggestions for its duration with no edit to any of them. The gateway
+// bypasses all four while translating anyway, so this is belt and braces —
+// but a frame in flight when the mode changed would otherwise land on a page
+// whose transcript container does not exist.
+type PageMode = 'home' | 'transcript' | 'list' | 'menu' | 'alert' | 'translate'
 let pageMode: PageMode = 'home'
+
+// --- translate mode, mirrored from the gateway --------------------------
+//
+// The gateway is authoritative for all three; nothing here sets them except
+// the onTranslate hook. `translatePair` is what the lens header is drawn
+// from, so it has to survive the gaps between utterances.
+let translateActive = false
+let translatePair: { a: string; b: string } = { a: 'en', b: 'es' }
+
+/**
+ * Clears the translated line off the lens when its hold elapses.
+ *
+ * The page does NOT go away with it — translate mode is still running, so
+ * the lens falls back to the header and "Listening…" rather than to
+ * captions. That is the difference between this and the suggestion timer:
+ * a suggestion is an interruption of the caption page, whereas this IS the
+ * page.
+ */
+let translateTimer: number | null = null
+
+/** The line on the lens right now, or null for the idle state. */
+let lensLine: LensTranslation | null = null
+
+/**
+ * A line that arrived while the one on the lens was still being read.
+ *
+ * WHY A QUEUE OF EXACTLY ONE. A long paragraph followed by a short remark
+ * used to lose: the short one replaced it instantly and the paragraph got
+ * whatever fraction of its hold had elapsed. Replacing is right for a
+ * SUGGESTION - it is an aside, and a newer one supersedes an older one - but
+ * a translation is a turn in a conversation and dropping one loses something
+ * a person actually said.
+ *
+ * So the current line is protected for its reading time and the newcomer
+ * waits. Depth one, not more: if three utterances land during one long
+ * paragraph, the lens is already behind the room and showing all of them in
+ * sequence would put it further behind. The newest is the one worth having,
+ * and every one of them is on the phone in full regardless.
+ */
+let lensQueued: LensTranslation | null = null
+
+/** Floor for a line's reading time, from the gateway's hold_ms. */
+let lensFloorMs = 10000
+
+/**
+ * The page to rebuild when the alert box goes away.
+ *
+ * Same role assistantReturnTo plays for the assistant box, and captured for
+ * the same reason: there is no page stack in this SDK, so "go back" can only
+ * mean "rebuild the thing we remember being there".
+ *
+ * 'alert' can never be stored here. showTimerAlert() refuses to open a
+ * second box over the first, so the value written is always a real page.
+ */
+let alertReturnTo: PageMode = 'home'
+
+/**
+ * Closes the alert box when its time is up. Null when no box is on screen.
+ *
+ * Doubles as THE FLAG for "an alert is up": pageMode === 'alert' says the
+ * same thing, but this is what a tap has to clear, so the two are set and
+ * cleared together in showTimerAlert() and closeTimerAlert().
+ */
+let alertTimer: number | null = null
+
+/**
+ * The assistant exchange the alert box interrupted, or null.
+ *
+ * Distinct from `assistant`, which keeps tracking the LIVE exchange while
+ * the box is up — a phase change or a dismissal can still arrive from the
+ * gateway during those seconds. This is the record that there was something
+ * to go back TO, so closeTimerAlert() can tell "the box interrupted an
+ * exchange" from "the box interrupted the caption page".
+ */
+let alertResumeAssistant: AssistantState | null = null
 
 // Conversate state, mirrored from the gateway. The gateway is authoritative;
 // this is only what the lens and phone display.
@@ -409,6 +534,7 @@ function hint(): string {
     const rec = sessionActive ? `Recording (${sessionUtterances}) · ` : ''
     return `${rec}Home · tap for menu`
   }
+  if (pageMode === 'alert') return 'Timer finished · tap to dismiss'
   if (pageMode === 'menu') return 'Menu · scroll · tap to select · double-tap to go back'
   if (pageMode === 'list') {
     // Title comes from the header line the gateway sent, so the hint names
@@ -583,6 +709,101 @@ try {
         }, hold)
         void pushSuggestion()
       },
+      /**
+       * "hey jarvis, set a timer for 20 minutes" — the command half.
+       *
+       * Nothing here touches the lens. startTimer() fires onTimerChanged,
+       * statusbar.ts starts its 1Hz loop off the back of that, and the
+       * countdown appears in the strip on the next write. The CONFIRMATION
+       * the wearer reads is a separate 'answer' frame that arrives a moment
+       * later and goes through the ordinary assistant path, so it dismisses
+       * itself on ANSWER_HOLD_MS like any other reply.
+       *
+       * A start REPLACES a running timer rather than queueing behind it —
+       * timer.ts holds exactly one. That is deliberate: if you set another
+       * one, that is the one you care about.
+       */
+      onTimer: (cmd) => {
+        if (cmd.action === 'cancel') {
+          const was = cancelTimer()
+          if (was === null) console.log('[app] timer cancel with none running')
+          return
+        }
+        if (typeof cmd.durationS !== 'number') {
+          // The gateway never sends a start without one, so this is a
+          // malformed frame rather than a case to handle. Logged rather
+          // than silently ignored: a countdown that simply fails to appear
+          // is otherwise indistinguishable from the wake word being missed.
+          console.warn('[app] timer start frame with no duration_s', cmd)
+          return
+        }
+        startTimer({
+          durationS: cmd.durationS,
+          title: cmd.title,
+          alertS: cmd.alertS,
+        })
+      },
+      onTranslate: (s: TranslateState) => {
+        console.log(`[app] translate ${s.active ? `${s.a} -> ${s.b}` : 'off'}`)
+        setTranslateState(s)
+
+        const was = translateActive
+        translateActive = s.active
+        if (s.active && s.a && s.b) translatePair = { a: s.a, b: s.b }
+
+        // ONLY act on a CHANGE. This hook also fires on every reconnect,
+        // from the translate_status stt.ts sends on open — and an inactive
+        // frame arriving while the wearer is reading captions must not
+        // rebuild the lens out from under them.
+        if (s.active === was) return
+
+        if (s.active) {
+          lensQueued = null
+          // Never steal the lens from a box that is mid-exchange or a timer
+          // alert that is mid-hold. Both are seconds long and both restore
+          // through returnToPage(), which now knows how to come back here —
+          // so the page arrives when the interruption ends.
+          if (assistant !== null || pageMode === 'alert') {
+            console.log('[app] translate started behind an overlay')
+            // Remember where to land. assistantReturnTo is read by
+            // restoreFromAssistant(); alertReturnTo by closeTimerAlert().
+            if (assistant !== null) assistantReturnTo = 'translate'
+            else alertReturnTo = 'translate'
+            return
+          }
+          lensLine = null
+          void showTranslate()
+        } else {
+          void endTranslateOnLens()
+        }
+      },
+      onTranslation: (line: TranslationLine) => {
+        // The phone gets EVERY line, both directions and the out-of-pair
+        // ones. The lens gets only what the gateway marked.
+        pushTranslation(line)
+
+        if (!line.translated || !line.lens) return
+        if (!translateActive) return
+        // An assistant box or an alert owns the lens while it is up. The
+        // line still goes to the phone above; it is simply not worth
+        // interrupting a box the wearer is reading for a translation whose
+        // ten seconds would be half gone by the time they looked back.
+        if (assistant !== null || pageMode === 'alert') return
+
+        void pushLensTranslation(
+          {
+            text: line.text,
+            from: line.from,
+            to: line.to,
+          },
+          // The FLOOR for this line's time on the lens, not its duration:
+          // pushLensTranslation() extends it for longer text. Read off the
+          // frame the gateway just sent, so the Translation hold slider
+          // applies from the next line with no reload. A gateway older than
+          // that tunable sends no hold_ms; 10s is its default.
+          line.holdMs ?? 10000,
+        )
+      },
       onSummary: (id, _text) => {
         console.log(`[app] summary ready for ${id}`)
         void refreshSessions()
@@ -609,6 +830,16 @@ try {
 
         assistant = s
         if (s) {
+          // The alert box owns the lens. Track the new phase so the box is
+          // replayed with the CURRENT state when the alert closes — an
+          // answer that arrives during those seconds should be the thing
+          // that comes back, not the "Thinking…" it replaced — but do not
+          // rebuild, or the alert is yanked off the lens by a frame the user
+          // cannot see.
+          if (pageMode === 'alert') {
+            alertResumeAssistant = s
+            return
+          }
           // The overlay REPLACES whatever page was up, including a list.
           // pageMode goes to 'transcript' for the duration because every
           // render guard in this file pairs it with `assistant === null`;
@@ -617,6 +848,16 @@ try {
           pageMode = 'transcript'
           void renderAssistant(s)
         } else {
+          // Same reasoning for the dismissal. stt.ts's ANSWER_HOLD_MS is 10s
+          // and an alert is typically 8, so an exchange that was already
+          // near its end can lapse while the box is up. Clearing the resume
+          // slot is what makes closeTimerAlert() fall through to
+          // alertReturnTo instead of replaying a box the gateway has since
+          // forgotten.
+          if (pageMode === 'alert') {
+            alertResumeAssistant = null
+            return
+          }
           void restoreFromAssistant()
         }
       },
@@ -637,10 +878,31 @@ mountSessions(
   tabs.Conversations,
 )
 
-// Prompt library, in the same tab and mounted AFTER mountSessions() so the
-// recording controls stay at the top of the panel — hosts are appended to in
-// call order. Independent of `stt`: it only talks to the gateway over REST,
-// so a failed socket leaves prompt editing working.
+// Translate panel. Mounted AFTER the socket exists, same reason as
+// mountSessions: its buttons send commands over it.
+mountTranslate(
+  {
+    start: (a: string, b: string) => stt?.startTranslate(a, b),
+    stop: () => stt?.stopTranslate(),
+  },
+  tabs.Translate,
+)
+
+// The one slider that belongs to this feature, on this feature's tab. Same
+// panel code as the Live one - same fetch, same debounced PUT - narrowed to
+// a single key, with no "Reset all" button since that would reset every
+// tunable in the app from a card that looks like it is about one.
+//
+// PANEL_ORDER.tuning puts it below the pair picker regardless of the order
+// these two were mounted in.
+void mountSettings(tabs.Translate, {
+  only: ['translate_hold_s'],
+  header: false,
+})
+
+// Prompt library, in the same tab. Where it lands vertically is PANEL_ORDER's
+// job, not this call's position. Independent of `stt`: it only talks to the
+// gateway over REST, so a failed socket leaves prompt editing working.
 void mountPrompts(tabs.Conversations)
 
 if (stt) {
@@ -833,12 +1095,36 @@ async function showHome() {
  */
 async function restoreFromAssistant() {
   console.log(`[assist] returning to ${assistantReturnTo}`)
-  switch (assistantReturnTo) {
+  await returnToPage(assistantReturnTo)
+}
+
+/**
+ * Rebuild a remembered page. The shared body of every "hand the lens back"
+ * path in this file.
+ *
+ * Split out of restoreFromAssistant() when the timer alert box arrived and
+ * needed the identical switch. Two copies would have been two places to
+ * remember that 'list' is rebuilt from retained lines and that
+ * lastNames/lastText have to be cleared — and the second copy is exactly
+ * where that gets forgotten.
+ *
+ * 'alert' is not a case: an alert is never the page you return TO, only the
+ * one you return FROM. It falls to the default, which is captions.
+ */
+async function returnToPage(mode: PageMode) {
+  switch (mode) {
     case 'home':
       await showHome()
       break
     case 'menu':
       await showMenu()
+      break
+    case 'translate':
+      // Reachable when an assistant box or a timer alert interrupted the
+      // translate page. `lensLine` may have been cleared by its hold while
+      // the interruption was up, in which case this rebuilds the idle
+      // header — which is correct: the line's ten seconds are over.
+      await showTranslate()
       break
     case 'list':
       // No retained lines means the list was never built in this session —
@@ -863,13 +1149,272 @@ async function restoreFromAssistant() {
   }
 }
 
-/** Rebuild the menu page. Reads current state for its labels and header. */
-async function showMenu() {
-  const ok = await showMenuPage(bridge, {
+/**
+ * Put the expired timer's title on the lens, full screen, and set the clock
+ * that takes it away again.
+ *
+ * THE ALERT SUSPENDS AN ASSISTANT EXCHANGE, IT DOES NOT END ONE.
+ *
+ * The first cut nulled `assistant` and called stt.dismiss(), which sends
+ * 'endconvo' — so a timer going off mid-answer threw away the follow-up
+ * window, the held history and the answer itself. "Take the lens" and "end
+ * the conversation" are two different things and that collapsed them.
+ *
+ * So nothing is torn down. `assistant` keeps its state, the exchange is
+ * remembered in alertResumeAssistant, and closeTimerAlert() rebuilds the box
+ * exactly as renderAssistant() left it — the box is sized from state on
+ * every phase change anyway, so replaying it is a normal operation and not a
+ * special restore path. The gateway is never told anything, because from its
+ * side nothing happened.
+ *
+ * What CAN still end the exchange while the box is up is stt.ts's own
+ * ANSWER_HOLD_MS timeout, which at 10s will usually outlast an 8s alert but
+ * not always. That arrives as onAssistant(null), and the handler below
+ * treats it as "there is nothing to resume" rather than rebuilding the page
+ * out from under the alert.
+ */
+async function showTimerAlert(t: TimerState) {
+  // A second timer cannot exist (timer.ts holds one), but an expiry landing
+  // while a box is already up would otherwise overwrite alertReturnTo with
+  // 'alert' and strand the lens there.
+  if (pageMode === 'alert') {
+    console.warn(`[timer] alert already up, ignoring ${t.id}`)
+    return
+  }
+
+  if (assistant !== null) {
+    // Where to go if the exchange dies during the alert: the page it was
+    // launched from, never 'transcript', which is only what pageMode is set
+    // to for the duration of a box.
+    alertReturnTo = assistantReturnTo
+    alertResumeAssistant = assistant
+    console.log('[timer] alert suspending assistant box')
+  } else {
+    alertReturnTo = pageMode
+    alertResumeAssistant = null
+  }
+
+  console.log(
+    `[timer] alert "${t.title}" for ${t.alertS}s (returning to ${alertReturnTo})`,
+  )
+
+  const ok = await showAlertPage(bridge, t.title)
+  if (!ok) {
+    setStatus('error', 'rebuildPageContainer failed (alert)')
+    console.error('Failed to build alert page')
+    // Nothing was put on the lens, so there is nothing to take off it and no
+    // timer to set. Whatever page was up is still up and pageMode still
+    // describes it.
+    alertResumeAssistant = null
+    return
+  }
+
+  pageMode = 'alert'
+  // THE ONE PAGE IN THIS APP WITHOUT THE STATUS STRIP. Containers 10, 11 and
+  // 13 are not on it, so statusbar.ts's clock, battery and countdown writes
+  // have to be suppressed until it comes down — otherwise they are issued
+  // against containers that do not exist, which the simulator reports as
+  // `container N not found` and real glasses silently drop.
+  setStripOnPage(false)
+  // The caption containers are not on this page either, so the debounced
+  // renderer's idea of what is on the lens is stale — same reason
+  // renderAssistant() and showHome() clear these.
+  lastNames = ''
+  lastText = ''
+  lastSuggestion = ''
+  bandOnPage = false
+  bandBorderOnPage = false
+  refreshStatus()
+
+  if (alertTimer !== null) window.clearTimeout(alertTimer)
+  // alertS is frozen per-timer in timer.ts, so a slider moved while this one
+  // was counting down does not change the alert it was set with.
+  alertTimer = window.setTimeout(() => {
+    alertTimer = null
+    void closeTimerAlert('elapsed')
+  }, t.alertS * 1000)
+}
+
+/**
+ * Take the alert box off the lens and rebuild what was underneath it.
+ *
+ * Reached two ways: the timeout above, and a tap. Guarded on pageMode rather
+ * than on alertTimer because the timeout nulls its own handle before calling
+ * — so on that path there is no timer left to test.
+ *
+ * setStripOnPage(true) happens BEFORE the rebuild, not after: every page
+ * below carries the strip, and statusContainers() bakes current content into
+ * all three containers as it builds them. Setting it afterwards would leave
+ * a window where the strip is on the lens but the push helpers still think
+ * it is not.
+ */
+async function closeTimerAlert(reason: string) {
+  if (pageMode !== 'alert') return
+  if (alertTimer !== null) {
+    window.clearTimeout(alertTimer)
+    alertTimer = null
+  }
+  setStripOnPage(true)
+
+  // An exchange was suspended AND is still live. Replay it. `assistant` is
+  // checked as well as the remembered copy because stt.ts's ANSWER_HOLD_MS
+  // may have expired the exchange while the box was up, in which case
+  // onAssistant(null) has already nulled it and there is nothing to go back
+  // to but the page it was launched from.
+  const resume = alertResumeAssistant
+  alertResumeAssistant = null
+  if (resume !== null && assistant !== null) {
+    console.log(`[timer] alert closed (${reason}) -> resuming assistant box`)
+    // pageMode and refreshStatus() are onAssistant's job on the normal path,
+    // so they have to be done by hand here.
+    pageMode = 'transcript'
+    await renderAssistant(assistant)
+    refreshStatus()
+    return
+  }
+
+  console.log(`[timer] alert closed (${reason}) -> ${alertReturnTo}`)
+  await returnToPage(alertReturnTo)
+}
+
+// The countdown reaching zero. timer.ts clears its own state BEFORE firing
+// this, so the rebuild below cannot bake a stale "00:00 left" into the strip
+// — and by the time this runs, statusbar.ts has already blanked the
+// countdown container and stopped its 1Hz interval.
+//
+// Deliberately not unsubscribed anywhere: it lives as long as the widget,
+// and cleanup() tears the whole WebView context down.
+onTimerExpired(t => {
+  void showTimerAlert(t)
+})
+
+/**
+ * Draw the translate page: either a line, or the idle header.
+ *
+ * Every path that puts translate mode on the lens comes through here, so
+ * pageMode and the stale-render bookkeeping are done in ONE place rather
+ * than at each call site.
+ */
+async function showTranslate() {
+  const ok = await showTranslatePage(bridge, lensLine ?? {
+    text: '',
+    from: translatePair.a,
+    to: translatePair.b,
+  })
+  if (!ok) {
+    setStatus('error', 'rebuildPageContainer failed (translate)')
+    console.error('Failed to build translate page')
+    return
+  }
+  pageMode = 'translate'
+  // The caption containers are not on this page, so the debounced renderer's
+  // idea of what is on the lens is stale — same reason renderAssistant(),
+  // showHome() and showTimerAlert() clear these.
+  lastNames = ''
+  lastText = ''
+  lastSuggestion = ''
+  bandOnPage = false
+  bandBorderOnPage = false
+  refreshStatus()
+}
+
+/**
+ * Show one line and set the clock for what happens when its time is up.
+ *
+ * The duration is derived from the line's LENGTH — see readMs() — so a
+ * paragraph gets longer than a four-word reply. `lensFloorMs` is the
+ * gateway's hold_ms, which the slider now sets as the MINIMUM rather than
+ * the fixed value.
+ */
+async function showLensLine(line: LensTranslation) {
+  lensLine = line
+  const ms = readMs(line.text, lensFloorMs)
+  console.log(`[translate] lens ${line.text.length} chars for ${ms}ms`)
+
+  if (translateTimer !== null) window.clearTimeout(translateTimer)
+  translateTimer = window.setTimeout(() => {
+    translateTimer = null
+    if (!translateActive || pageMode !== 'translate') {
+      lensLine = null
+      lensQueued = null
+      return
+    }
+    // Something arrived while this one was being read: show it now rather
+    // than passing through the idle state, which would blink the lens.
+    const next = lensQueued
+    lensQueued = null
+    if (next) {
+      void showLensLine(next)
+      return
+    }
+    // Back to the idle label, NOT to captions: translate mode is still
+    // running and the next utterance belongs on this page.
+    lensLine = null
+    void showTranslate()
+  }, ms)
+
+  await showTranslate()
+}
+
+/**
+ * A translation the gateway marked for the lens.
+ *
+ * Holds it back if the line already up has not had its reading time. Only
+ * the NEWEST waiting line is kept; see lensQueued.
+ */
+async function pushLensTranslation(line: LensTranslation, holdMs: number) {
+  lensFloorMs = holdMs
+
+  if (translateTimer !== null) {
+    // Something is still being read. Wait behind it.
+    lensQueued = line
+    console.log('[translate] queued behind the line being read')
+    return
+  }
+
+  await showLensLine(line)
+}
+
+/** Leave translate mode on the lens. Called when the gateway says it ended. */
+async function endTranslateOnLens() {
+  if (translateTimer !== null) {
+    window.clearTimeout(translateTimer)
+    translateTimer = null
+  }
+  lensLine = null
+  lensQueued = null
+  // Home rather than captions. Translate mode is started from the phone, so
+  // the wearer did not come here from the caption page and should not be
+  // dropped into it — home is the root of the lens hierarchy.
+  if (pageMode === 'translate') await showHome()
+}
+
+/**
+ * The state the menu draws itself from.
+ *
+ * ONE builder, used by both showMenu() and runMenuSelection(). They have to
+ * agree: the selection maps an INDEX back to an action by matching the label
+ * the OS reported against menuLabels(), so a state that differed between the
+ * two would map a tap to the wrong item.
+ *
+ * `translatePair` comes from the phone panel's last used pair rather than
+ * from `translatePair` here, which only holds a pair while a translation is
+ * actually running. Before the first one of the session there is nothing in
+ * it, and the menu still has to be able to offer a sensible default.
+ */
+function menuState() {
+  return {
     sessionActive,
     micOn,
     utterances: sessionUtterances,
-  })
+    translateActive,
+    translatePair: translateActive ? translatePair : lastPair(),
+  }
+}
+
+/** Rebuild the menu page. Reads current state for its labels and header. */
+async function showMenu() {
+  const ok = await showMenuPage(bridge, menuState())
   if (!ok) {
     setStatus('error', 'rebuildPageContainer failed (menu)')
     console.error('Failed to build menu page')
@@ -932,7 +1477,7 @@ function toggleSession() {
  * and therefore survives the wire intact.
  */
 async function runMenuSelection(index: number | undefined, name: string | undefined) {
-  const labels = menuLabels({ sessionActive, micOn, utterances: sessionUtterances })
+  const labels = menuLabels(menuState())
   let i = index ?? 0
   if (name) {
     const byName = labels.indexOf(name)
@@ -945,6 +1490,23 @@ async function runMenuSelection(index: number | undefined, name: string | undefi
   switch (action) {
     case 'captions':
       await showCaptions()
+      break
+    case 'translate':
+      // Fire and forget: the gateway's 'translate' frame is what actually
+      // moves the lens, through the onTranslate hook. Rebuilding the menu
+      // here would race that frame and could leave a stale label up.
+      //
+      // Nothing is drawn on failure either. If the socket is down the
+      // command is dropped with a warning from sendCmd() and the menu simply
+      // stays put, which is the honest outcome - the mode did not start.
+      if (translateActive) {
+        console.log('[menu] stopping translation')
+        stt?.stopTranslate()
+      } else {
+        const p = lastPair()
+        console.log(`[menu] starting translation ${p.a} -> ${p.b}`)
+        stt?.startTranslate(p.a, p.b)
+      }
       break
     case 'session':
       toggleSession()
@@ -980,6 +1542,16 @@ async function goBack() {
   // else. So "back" from a feature page goes to the menu's parent, home —
   // never to captions, which is one of the things the menu launches rather
   // than the page underneath it.
+  // Double tap ENDS TRANSLATE MODE rather than merely leaving the page.
+  // Leaving would strand the gateway translating with nothing on the lens
+  // to show for it, and the only way back would be the phone. The gateway's
+  // 'translate' frame then drives endTranslateOnLens(), so the lens and the
+  // mode come down together rather than one guessing about the other.
+  if (pageMode === 'translate') {
+    console.log('[app] double-tap in translate -> ending translate mode')
+    stt?.stopTranslate()
+    return
+  }
   if (pageMode === 'home') {
     // Nothing above home. The only useful thing a gesture can do here is open
     // the menu, and both gestures do it rather than one of them being dead.
@@ -1006,6 +1578,18 @@ function cleanup() {
   if (suggestTimer !== null) {
     window.clearTimeout(suggestTimer)
     suggestTimer = null
+  }
+  // Same reason: it would fire a rebuildPageContainer against a torn-down
+  // bridge some seconds after the widget had gone.
+  if (alertTimer !== null) {
+    window.clearTimeout(alertTimer)
+    alertTimer = null
+  }
+  // Same reason again: it would fire a rebuildPageContainer against a
+  // torn-down bridge up to ten seconds after the widget had gone.
+  if (translateTimer !== null) {
+    window.clearTimeout(translateTimer)
+    translateTimer = null
   }
   unsubscribe()
 }
@@ -1043,6 +1627,30 @@ const unsubscribe = bridge.onEvenHubEvent(event => {
   // In list modes (list, menu) the LIST holds isEventCapture, so taps and
   // scrolls arrive as listEvent rather than textEvent.
   const listType = eventTypeOf(event.listEvent)
+
+  // THE ALERT BOX OWNS EVERY GESTURE, and it is checked before the
+  // double-tap branch rather than inside it.
+  //
+  // The box is the only container on its page and it is the only thing on
+  // the lens, so there is no "select" to distinguish from "back" — both mean
+  // the same thing, which is "I have seen it, take it away". Routing a
+  // double tap to goBack() instead would send the lens to the menu rather
+  // than to the page the alert interrupted.
+  if (pageMode === 'alert') {
+    const tapped =
+      sysType === OsEventTypeList.CLICK_EVENT ||
+      textType === OsEventTypeList.CLICK_EVENT ||
+      listType === OsEventTypeList.CLICK_EVENT ||
+      sysType === OsEventTypeList.DOUBLE_CLICK_EVENT ||
+      textType === OsEventTypeList.DOUBLE_CLICK_EVENT ||
+      listType === OsEventTypeList.DOUBLE_CLICK_EVENT
+    if (tapped) {
+      void closeTimerAlert('tapped')
+      return
+    }
+    // A SYSTEM_EXIT_EVENT still has to fall through to cleanup() below, so
+    // this deliberately does not return on everything.
+  }
 
   if (
     sysType === OsEventTypeList.DOUBLE_CLICK_EVENT ||
@@ -1097,6 +1705,15 @@ const unsubscribe = bridge.onEvenHubEvent(event => {
         event.listEvent?.currentSelectItemIndex,
         event.listEvent?.currentSelectItemName,
       )
+    } else if (pageMode === 'translate') {
+      // A single tap does NOTHING here, deliberately.
+      //
+      // The obvious candidates are both wrong: toggling the mic would stop
+      // the conversation being translated with no visible sign of why, and
+      // clearing the line early would take away the thing the person
+      // opposite is reading. Double tap ends the mode, which is the only
+      // action this page has.
+      console.log('[translate] tap ignored — double-tap to end')
     } else if (pageMode === 'home') {
       // The home page shows nothing, so there is nothing on it to act on.
       // Tap opens the menu — the same thing double tap does, because a blank

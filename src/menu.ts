@@ -50,24 +50,49 @@ const MAX_ITEM_CHARS = 64
  * ("Start conversation" / "Stop & save"), so the label cannot be the key -
  * main.ts maps the selected INDEX back to one of these.
  */
-export type MenuAction = 'captions' | 'session' | 'mic' | 'exit'
+export type MenuAction =
+  | 'captions'
+  | 'translate'
+  | 'session'
+  | 'mic'
+  | 'exit'
 
 /**
  * Fixed order. Index N here is index N in the list on the lens, which is
  * what makes the index-to-action mapping safe.
  */
-export const MENU_ACTIONS: MenuAction[] = ['captions', 'session', 'mic', 'exit']
+export const MENU_ACTIONS: MenuAction[] = [
+  'captions',
+  'translate',
+  'session',
+  'mic',
+  'exit',
+]
 
 export interface MenuState {
   sessionActive: boolean
   micOn: boolean
   utterances: number
+  /** Translate mode running right now. */
+  translateActive: boolean
+  /**
+   * The pair the Translate item will start, as internal codes.
+   *
+   * The LABEL carries it - "Translate EN › ES" - because starting a
+   * translation from the lens offers no chance to pick one. Without the
+   * pair on the item, the only way to find out which direction is about to
+   * start would be to start it and look.
+   */
+  translatePair: { a: string; b: string }
 }
 
 /** Labels for the current state, in MENU_ACTIONS order. */
 export function menuLabels(state: MenuState): string[] {
+  const pair =
+    `${state.translatePair.a.toUpperCase()} › ${state.translatePair.b.toUpperCase()}`
   return [
     'Captions',
+    state.translateActive ? 'Stop translation' : `Translate ${pair}`,
     state.sessionActive ? 'Stop & save' : 'Start conversation',
     state.micOn ? 'Pause mic' : 'Resume mic',
     'Exit',
@@ -76,6 +101,13 @@ export function menuLabels(state: MenuState): string[] {
 
 /** Header line for the current state. */
 export function menuHeader(state: MenuState): string {
+  // Translate first: it OWNS the lens while it runs, so it is the more
+  // urgent of the two states to see from here. A recording can be running
+  // underneath it and is reported again the moment translation stops.
+  if (state.translateActive) {
+    return `TRANSLATING · ${state.translatePair.a.toUpperCase()} › ` +
+      `${state.translatePair.b.toUpperCase()}`
+  }
   if (!state.sessionActive) return 'Menu'
   return `REC · ${state.utterances} line${state.utterances === 1 ? '' : 's'}`
 }

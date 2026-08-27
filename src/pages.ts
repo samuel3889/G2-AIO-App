@@ -43,6 +43,10 @@ import {
   captionBodyH,
 } from './captions'
 import { suggestContainers } from './suggest'
+// The alert box borrows overlay.ts's line metrics rather than declaring a
+// second copy. Not a cycle: overlay.ts imports statusbar.ts and nothing else
+// from this side of the app.
+import { countLines, LINE_HEIGHT } from './overlay'
 
 /**
  * Container IDs owned by this module.
@@ -114,6 +118,20 @@ export const MESSAGE_NAME = 'message'
  */
 export const HOME_ID = 12
 export const HOME_NAME = 'home'
+
+/**
+ * The full-screen alert box — currently used only by the expiry of a
+ * countdown timer, but deliberately named for the SHAPE rather than the
+ * feature, because "one container, whole lens, holds one message, goes away
+ * by itself" is not specific to timers.
+ *
+ * 13 is the countdown container in the status strip (TIMER_ID in
+ * statusbar.ts), so this takes 14. Allocation across the app is now: 1
+ * transcript, 2/3 plex, 4/5 menu, 6/7 assistant overlay, 8 names, 9 message,
+ * 10/11 status clock+battery, 12 home, 13 status countdown, 14 this.
+ */
+export const ALERT_ID = 14
+export const ALERT_NAME = 'alert'
 
 /**
  * The transcript container on its own.
@@ -328,6 +346,123 @@ export async function showHomePage(
   bridge: { rebuildPageContainer: (c: RebuildPageContainer) => Promise<boolean> },
 ): Promise<boolean> {
   const text = [homeContainer(), ...statusContainers()]
+  return bridge.rebuildPageContainer(
+    new RebuildPageContainer({
+      containerTotalNum: text.length,
+      textObject: text,
+    }),
+  )
+}
+
+// --- full-screen alert ------------------------------------------------------
+
+/**
+ * Border colour, 0-16. Matches the assistant overlay's box so the two read
+ * as the same kind of object — something that has taken the lens and will
+ * hand it back.
+ */
+const ALERT_BORDER_COLOR = 12
+
+const ALERT_PADDING = 6
+
+/**
+ * Characters per line for the alert box.
+ *
+ * Wider than overlay.ts's CHARS_PER_LINE because the alert box spans the
+ * FULL 576px rather than that box's 520px inset. Scaled from it in the same
+ * proportion rather than measured, since it is only used to count rows for
+ * the vertical centring below — being a few characters out moves the message
+ * by at most one row.
+ */
+const ALERT_CHARS_PER_LINE = 60
+
+/**
+ * Rows the box can hold, used only to push the message down toward the
+ * middle. LINE_HEIGHT is overlay.ts's estimate for BODY text and is
+ * explicitly marked unverified there — but a wrong value here costs a few
+ * px of vertical offset, not a clipped word, so it is safe to borrow.
+ */
+const ALERT_ROWS = Math.floor((288 - ALERT_PADDING * 2) / LINE_HEIGHT)
+
+/**
+ * The full-screen alert container.
+ *
+ * COVERS THE WHOLE LENS, INCLUDING THE STATUS STRIP. Every other page in
+ * this app reserves the top STATUS_H px for the clock and battery; this one
+ * does not, and showAlertPage() below omits the strip containers entirely
+ * rather than drawing the box over them.
+ *
+ * That is a deliberate choice over stacking. overlay.ts's HIGHER_IS_FRONT is
+ * flagged there as the one thing in the z-order model that was never
+ * established empirically — the SDK documents zOrderIndex as controlling
+ * stacking and validates it, but states nowhere which direction is front. A
+ * page that relies on getting that right would either work or silently draw
+ * the clock on top of the alert, and there is no way to tell from the code
+ * which. Omitting the strip needs no such assumption: there is one container
+ * on the page, so nothing can be in front of anything.
+ *
+ * The cost is that the clock and battery are gone for the few seconds the
+ * box is up. That is the correct trade for something whose entire job is to
+ * be impossible to miss.
+ *
+ * `isEventCapture` is 1 because it is the only container here and a tap must
+ * dismiss the box early — see the 'alert' branch of the event router in
+ * main.ts.
+ */
+export function alertContainer(message: string): TextContainerProperty {
+  return new TextContainerProperty({
+    xPosition: 0,
+    yPosition: 0,
+    width: 576,
+    height: 288,
+    borderWidth: 2,
+    borderColor: ALERT_BORDER_COLOR,
+    borderRadius: 4,
+    paddingLength: ALERT_PADDING,
+    containerID: ALERT_ID,
+    containerName: ALERT_NAME,
+    content: message,
+    isEventCapture: 1,
+    // Only container on the page, so this is the whole z-order. It still has
+    // to be SET: the validator is all-or-nothing per page, and a page whose
+    // one container omits zOrderIndex is fine, but one that sets it on some
+    // and not others is rejected. Setting it always is the habit that keeps
+    // a second container from breaking this later.
+    zOrderIndex: 0,
+  })
+}
+
+/**
+ * Vertically centre a short message by padding it with blank lines.
+ *
+ * This is the one alignment trick in this codebase that is actually SAFE.
+ * Horizontal padding with spaces does not work — pages.ts's speaker column
+ * documents why, the font is proportional and a space is not a fixed
+ * fraction of a glyph. But LINE HEIGHT is uniform whatever the glyphs are,
+ * so a leading newline moves text down by exactly one row every time.
+ *
+ * Horizontal centring is still not available and is not attempted: the
+ * message sits at the left padding. There is no text-alignment property on
+ * TextContainerProperty at all (index.d.ts:356-377).
+ */
+function centreVertically(message: string): string {
+  const used = countLines(message, ALERT_CHARS_PER_LINE)
+  const blank = Math.max(0, Math.floor((ALERT_ROWS - used) / 2))
+  return '\n'.repeat(blank) + message
+}
+
+/**
+ * Put one message on the lens, full screen, no status strip.
+ *
+ * ONE container, so containerTotalNum is 1. Returns the boolean
+ * rebuildPageContainer gives, NOT the numeric code from
+ * createStartUpPageContainer — callers check `!ok`, not `!== 0`.
+ */
+export async function showAlertPage(
+  bridge: { rebuildPageContainer: (c: RebuildPageContainer) => Promise<boolean> },
+  message: string,
+): Promise<boolean> {
+  const text = [alertContainer(centreVertically(message))]
   return bridge.rebuildPageContainer(
     new RebuildPageContainer({
       containerTotalNum: text.length,

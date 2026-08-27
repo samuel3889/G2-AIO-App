@@ -22,6 +22,20 @@
  *    modal you cannot style and sometimes cannot dismiss cleanly.
  *  - Summarise failures land inline instead of in an alert().
  *
+ * WHAT CHANGED IN THE SECTIONS PASS
+ *  - Both cards are collapsible with remembered state. Recording, Saved
+ *    conversations, Review and Suggestion prompts are now four peer sections
+ *    of ONE tab, so any of them being permanently expanded would bury the
+ *    others below the fold.
+ *  - Recording starts OPEN on a fresh install: it is the only section with a
+ *    button you press mid-conversation, and a section you must unfold first is
+ *    a section you cannot press while walking.
+ *  - Saved conversations wears `archive`, not `chat` — `chat` is the icon on
+ *    the Conversations tab itself, and a section repeating its parent's icon
+ *    reads as a duplicate rather than a child.
+ *  - The panel root carries PANEL_ORDER.sessions so it stacks above Review and
+ *    Prompts regardless of mount order.
+ *
  * Endpoints used, all as defined in routes_sessions.py:
  *   GET    /sessions               -> { sessions: [...] }
  *   GET    /sessions/{id}/text     -> { text, summary }
@@ -30,7 +44,7 @@
  */
 import type { SessionState } from './asr/stt'
 import { restBase, restUrl } from './api'
-import { installTheme, makeCard, icon } from './theme'
+import { installTheme, makeCard, icon, PANEL_ORDER } from './theme'
 
 interface StoredSession {
   id: string
@@ -97,6 +111,8 @@ export function mountSessions(c: Controls, host?: HTMLElement) {
 
   const root = document.createElement('div')
   root.className = 'g2-stack g2c'
+  // The host is a flex column; `order` is what fixes the reading order.
+  root.style.order = String(PANEL_ORDER.sessions)
   ;(host ?? document.body).appendChild(root)
 
   // --- recording -----------------------------------------------------------
@@ -104,6 +120,11 @@ export function mountSessions(c: Controls, host?: HTMLElement) {
     title: 'Recording',
     sub: 'Captured and summarised on the gateway',
     icon: 'record',
+    collapsible: true,
+    // Open on a fresh install. `memory` overrides this once the user has
+    // folded it themselves, so the preference sticks either way.
+    open: true,
+    memory: 'rec',
   })
   liveChip = document.createElement('span')
   liveChip.className = 'chip mute'
@@ -138,7 +159,10 @@ export function mountSessions(c: Controls, host?: HTMLElement) {
   const arch = makeCard({
     title: 'Saved conversations',
     sub: 'Survives app restarts',
-    icon: 'chat',
+    icon: 'archive',
+    collapsible: true,
+    open: false,
+    memory: 'saved',
   })
   countChip = document.createElement('span')
   countChip.className = 'chip mute'
