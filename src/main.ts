@@ -11,6 +11,7 @@ import {
   type AssistantState,
   type TranslateState,
   type TranslationLine,
+  type NoteDue,
 } from './asr/stt'
 import { mountUi, setStatus, setTranscript } from './ui'
 import {
@@ -68,11 +69,15 @@ import {
   startStatusUpdates,
   setStripOnPage,
 } from './statusbar'
+// TimerState is no longer imported: showAlert() takes a plain
+// {kind,id,title,alertS} now that a note can raise the same box, and
+// nothing else in this file names the type. tsconfig has noUnusedLocals,
+// so leaving it would fail the build rather than warn.
 import {
   onTimerExpired,
   startTimer,
   cancelTimer,
-  type TimerState,
+  resolveAlertMs,
 } from './timer'
 
 // Phone UI: one tab bar, TWO hosts. Every panel is mounted ONCE, here at
@@ -357,7 +362,7 @@ let lensFloorMs = 10000
  * the same reason: there is no page stack in this SDK, so "go back" can only
  * mean "rebuild the thing we remember being there".
  *
- * 'alert' can never be stored here. showTimerAlert() refuses to open a
+ * 'alert' can never be stored here. showAlert() refuses to open a
  * second box over the first, so the value written is always a real page.
  */
 let alertReturnTo: PageMode = 'home'
@@ -367,7 +372,7 @@ let alertReturnTo: PageMode = 'home'
  *
  * Doubles as THE FLAG for "an alert is up": pageMode === 'alert' says the
  * same thing, but this is what a tap has to clear, so the two are set and
- * cleared together in showTimerAlert() and closeTimerAlert().
+ * cleared together in showAlert() and closeAlert().
  */
 let alertTimer: number | null = null
 
@@ -377,7 +382,7 @@ let alertTimer: number | null = null
  * Distinct from `assistant`, which keeps tracking the LIVE exchange while
  * the box is up — a phase change or a dismissal can still arrive from the
  * gateway during those seconds. This is the record that there was something
- * to go back TO, so closeTimerAlert() can tell "the box interrupted an
+ * to go back TO, so closeAlert() can tell "the box interrupted an
  * exchange" from "the box interrupted the caption page".
  */
 let alertResumeAssistant: AssistantState | null = null
@@ -595,7 +600,11 @@ function hint(): string {
     const rec = sessionActive ? `Recording (${sessionUtterances}) · ` : ''
     return `${rec}Home · tap for captions · hold for menu · double-tap to exit`
   }
-  if (pageMode === 'alert') return 'Timer finished · tap to dismiss'
+  if (pageMode === 'alert') {
+    return alertKind === 'note'
+      ? 'Note due · tap to dismiss'
+      : 'Timer finished · tap to dismiss'
+  }
   if (pageMode === 'list') {
     // Title comes from the header line the gateway sent, so the hint names
     // whatever is actually on the lens rather than one hardcoded source.
@@ -812,6 +821,41 @@ try {
           alertS: cmd.alertS,
         })
       },
+      /**
+       * A note's due time has passed — the popup half of the notes feature.
+       *
+       * UNSOLICITED, unlike onTimer. Nothing on the lens led up to this and
+       * no 'answer' frame follows it, so putting the box up IS the whole
+       * response. That is also why it goes straight to showAlert() rather
+       * than through the assistant path: there is no exchange to resolve.
+       *
+       * The gateway sends at most one of these per poll and marks the note
+       * before sending, so this cannot arrive twice for the same note or in
+       * a burst. showAlert() still guards against a box already being up,
+       * because a note can come due while a TIMER alert is on the lens.
+       */
+      onNoteDue: (note: NoteDue) => {
+        if (!note.title) {
+          // notestore.create() falls back to the raw text when there is no
+          // structured title, so the gateway never sends an empty one. A
+          // blank full-screen box would read as a rendering fault and send
+          // you looking in the wrong place, so it is logged and dropped.
+          console.warn('[app] note_due frame with no title', note)
+          return
+        }
+        // Clamped HERE, through the same resolveAlertMs() the timer path
+        // uses, so one function decides what a hold may be however the
+        // frame got here. A gateway older than the note_alert_s tunable
+        // sends no alert_s at all, and that falls back to ALERT_S_DEFAULT
+        // rather than to no hold — a box with no timeout would own the lens
+        // until it was tapped.
+        void showAlert({
+          kind: 'note',
+          id: note.id,
+          title: note.title,
+          alertS: resolveAlertMs(note.alertS) / 1000,
+        })
+      },
       onTranslate: (s: TranslateState) => {
         console.log(`[app] translate ${s.active ? `${s.a} -> ${s.b}` : 'off'}`)
         setTranslateState(s)
@@ -835,7 +879,7 @@ try {
           if (assistant !== null || pageMode === 'alert') {
             console.log('[app] translate started behind an overlay')
             // Remember where to land. assistantReturnTo is read by
-            // restoreFromAssistant(); alertReturnTo by closeTimerAlert().
+            // restoreFromAssistant(); alertReturnTo by closeAlert().
             if (assistant !== null) assistantReturnTo = 'translate'
             else alertReturnTo = 'translate'
             return
@@ -920,7 +964,7 @@ try {
           // Same reasoning for the dismissal. stt.ts's ANSWER_HOLD_MS is 10s
           // and an alert is typically 8, so an exchange that was already
           // near its end can lapse while the box is up. Clearing the resume
-          // slot is what makes closeTimerAlert() fall through to
+          // slot is what makes closeAlert() fall through to
           // alertReturnTo instead of replaying a box the gateway has since
           // forgotten.
           if (pageMode === 'alert') {
@@ -1226,8 +1270,32 @@ async function returnToPage(mode: PageMode) {
 }
 
 /**
- * Put the expired timer's title on the lens, full screen, and set the clock
- * that takes it away again.
+ * What put the alert box on the lens. Drives the status hint and the log
+ * prefix, and nothing else — the page itself is identical either way.
+ *
+ * 'timer' is a countdown the wearer set minutes ago and is expecting.
+ * 'note' is a due date arriving unannounced, possibly hours after the note
+ * was written, which is why the two get different holds (note_alert_s vs
+ * timer_alert_s) and different wording on the phone.
+ */
+type AlertKind = 'timer' | 'note'
+
+/**
+ * Which of the two put the CURRENT box up. Meaningless unless
+ * pageMode === 'alert'; set by showAlert() before the page is built so
+ * hint() is already correct by the time refreshStatus() runs.
+ */
+let alertKind: AlertKind = 'timer'
+
+/**
+ * Put a title on the lens, full screen, and set the clock that takes it
+ * away again.
+ *
+ * TWO CALLERS, ONE PAGE. An expired timer and a note that has come due are
+ * the same event as far as the lens is concerned — something the wearer
+ * asked to be interrupted by has arrived — so they share the page, the
+ * suspend/resume logic below, the tap handler and the return path. Only the
+ * hold and the wording differ, and both of those ride in on the call.
  *
  * THE ALERT SUSPENDS AN ASSISTANT EXCHANGE, IT DOES NOT END ONE.
  *
@@ -1237,7 +1305,7 @@ async function returnToPage(mode: PageMode) {
  * the conversation" are two different things and that collapsed them.
  *
  * So nothing is torn down. `assistant` keeps its state, the exchange is
- * remembered in alertResumeAssistant, and closeTimerAlert() rebuilds the box
+ * remembered in alertResumeAssistant, and closeAlert() rebuilds the box
  * exactly as renderAssistant() left it — the box is sized from state on
  * every phase change anyway, so replaying it is a normal operation and not a
  * special restore path. The gateway is never told anything, because from its
@@ -1249,12 +1317,31 @@ async function returnToPage(mode: PageMode) {
  * treats it as "there is nothing to resume" rather than rebuilding the page
  * out from under the alert.
  */
-async function showTimerAlert(t: TimerState) {
-  // A second timer cannot exist (timer.ts holds one), but an expiry landing
-  // while a box is already up would otherwise overwrite alertReturnTo with
-  // 'alert' and strand the lens there.
+async function showAlert(opts: {
+  kind: AlertKind
+  /** Identity, for the log line only. A timer id, or a note id. */
+  id: string
+  /** What fills the lens. */
+  title: string
+  /** How long it holds, in SECONDS, already clamped by the caller. */
+  alertS: number
+}) {
+  // Only one box at a time. A timer expiry cannot collide with itself
+  // (timer.ts holds exactly one countdown), but a note coming due while a
+  // timer alert is up is an ordinary race now that there are two sources —
+  // and opening the second would overwrite alertReturnTo with 'alert' and
+  // strand the lens there with nothing to return to.
+  //
+  // The loser is DROPPED, not queued. For a note that is safe: the gateway
+  // has already marked it alerted, so it will not be sent again, but the
+  // note is still in the list, still overdue and still shows its date when
+  // the wearer next looks. Queueing would mean a second full-screen
+  // interruption arriving seconds after the first, which is worse than
+  // missing one.
   if (pageMode === 'alert') {
-    console.warn(`[timer] alert already up, ignoring ${t.id}`)
+    console.warn(
+      `[${opts.kind}] alert already up (${alertKind}), ignoring ${opts.id}`,
+    )
     return
   }
 
@@ -1264,17 +1351,22 @@ async function showTimerAlert(t: TimerState) {
     // to for the duration of a box.
     alertReturnTo = assistantReturnTo
     alertResumeAssistant = assistant
-    console.log('[timer] alert suspending assistant box')
+    console.log(`[${opts.kind}] alert suspending assistant box`)
   } else {
     alertReturnTo = pageMode
     alertResumeAssistant = null
   }
 
+  // Set BEFORE the build, so hint() is already correct when refreshStatus()
+  // runs below and the phone never shows "Timer finished" under a note.
+  alertKind = opts.kind
+
   console.log(
-    `[timer] alert "${t.title}" for ${t.alertS}s (returning to ${alertReturnTo})`,
+    `[${opts.kind}] alert "${opts.title}" for ${opts.alertS}s ` +
+      `(returning to ${alertReturnTo})`,
   )
 
-  const ok = await showAlertPage(lensBridge, t.title)
+  const ok = await showAlertPage(lensBridge, opts.title)
   if (!ok) {
     setStatus('error', 'rebuildPageContainer failed (alert)')
     console.error('Failed to build alert page')
@@ -1303,12 +1395,14 @@ async function showTimerAlert(t: TimerState) {
   refreshStatus()
 
   if (alertTimer !== null) window.clearTimeout(alertTimer)
-  // alertS is frozen per-timer in timer.ts, so a slider moved while this one
-  // was counting down does not change the alert it was set with.
+  // Already clamped by the caller — timer.ts freezes alertS onto the timer
+  // when it is set, and the note path runs the frame's alert_s through the
+  // same resolveAlertMs(). Both go through ONE clamp, so a bad value from
+  // the gateway cannot pin the lens indefinitely from either direction.
   alertTimer = window.setTimeout(() => {
     alertTimer = null
-    void closeTimerAlert('elapsed')
-  }, t.alertS * 1000)
+    void closeAlert('elapsed')
+  }, opts.alertS * 1000)
 }
 
 /**
@@ -1324,7 +1418,7 @@ async function showTimerAlert(t: TimerState) {
  * a window where the strip is on the lens but the push helpers still think
  * it is not.
  */
-async function closeTimerAlert(reason: string) {
+async function closeAlert(reason: string) {
   if (pageMode !== 'alert') return
   if (alertTimer !== null) {
     window.clearTimeout(alertTimer)
@@ -1340,7 +1434,9 @@ async function closeTimerAlert(reason: string) {
   const resume = alertResumeAssistant
   alertResumeAssistant = null
   if (resume !== null && assistant !== null) {
-    console.log(`[timer] alert closed (${reason}) -> resuming assistant box`)
+    console.log(
+      `[${alertKind}] alert closed (${reason}) -> resuming assistant box`,
+    )
     // pageMode and refreshStatus() are onAssistant's job on the normal path,
     // so they have to be done by hand here.
     pageMode = 'transcript'
@@ -1349,7 +1445,7 @@ async function closeTimerAlert(reason: string) {
     return
   }
 
-  console.log(`[timer] alert closed (${reason}) -> ${alertReturnTo}`)
+  console.log(`[${alertKind}] alert closed (${reason}) -> ${alertReturnTo}`)
   await returnToPage(alertReturnTo)
 }
 
@@ -1361,7 +1457,15 @@ async function closeTimerAlert(reason: string) {
 // Deliberately not unsubscribed anywhere: it lives as long as the widget,
 // and cleanup() tears the whole WebView context down.
 onTimerExpired(t => {
-  void showTimerAlert(t)
+  void showAlert({
+    kind: 'timer',
+    id: t.id,
+    title: t.title,
+    // Frozen onto the timer by timer.ts when it was set, and already
+    // clamped there — so a slider moved while this one was counting down
+    // does not change the alert it was set with.
+    alertS: t.alertS,
+  })
 })
 
 /**
@@ -1385,7 +1489,7 @@ async function showTranslate() {
   pageMode = 'translate'
   // The caption containers are not on this page, so the debounced renderer's
   // idea of what is on the lens is stale — same reason renderAssistant(),
-  // showHome() and showTimerAlert() clear these.
+  // showHome() and showAlert() clear these.
   lastNames = ''
   lastText = ''
   lastSuggestion = ''
@@ -1929,7 +2033,7 @@ const unsubscribe = bridge.onEvenHubEvent(event => {
       textType === OsEventTypeList.DOUBLE_CLICK_EVENT ||
       listType === OsEventTypeList.DOUBLE_CLICK_EVENT
     if (tapped) {
-      void closeTimerAlert('tapped')
+      void closeAlert('tapped')
       return
     }
     // A SYSTEM_EXIT_EVENT still has to fall through to cleanup() below, so

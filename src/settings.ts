@@ -170,6 +170,13 @@ const GROUPS: Group[] = [
     keys: ['timer_alert_s'],
   },
   {
+    id: 'notes',
+    title: 'Notes',
+    sub: 'The full-screen alert when a note comes due',
+    icon: 'clock',
+    keys: ['note_alert_s'],
+  },
+  {
     id: 'translate',
     title: 'Lens timing',
     sub: 'How long a translated line stays up',

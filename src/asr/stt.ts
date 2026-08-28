@@ -10,8 +10,8 @@
  *                  "translate_start"|"translate_stop"|"translate_status"}.
  * Wire format in:  JSON - {type:"ready"|"speech"|"partial"|"final"|"wake"|
  *                          "question"|"thinking"|"answer"|"convo"|
- *                          "session"|"summary"|"timer"|"translate"|
- *                          "translation"|"error", ...}
+ *                          "session"|"summary"|"timer"|"note_due"|
+ *                          "translate"|"translation"|"error", ...}
  *
  * Env (in .env.local):
  *   VITE_GATEWAY_URL=wss://g2gateway.sams-server.duckdns.org:50443/ws/stt
@@ -243,6 +243,29 @@ export interface SttHooks {
    */
   onTimer?: (cmd: TimerCommand) => void
   /**
+   * A note's due time has passed, from {"type":"note_due"}.
+   *
+   * UNSOLICITED, like 'suggest' and unlike 'timer'. Nobody said a wake
+   * word, no exchange is open, and there is no accompanying 'answer' frame
+   * to resolve - the gateway's watcher noticed a deadline go by and sent
+   * this on its own.
+   *
+   * Deliberately NOT routed through onResult() or showOverlay(), for the
+   * same reason 'suggest' is not: those feed the caption buffer, and a
+   * reminder that went that way would be recorded in the transcript as
+   * though someone in the room had said it.
+   *
+   * NOT gated on `overlay`. The alert page owns the whole lens whatever was
+   * on it, so unlike a suggestion there is no page state that makes this
+   * write pointless - main.ts decides whether to show it, and is the only
+   * thing that knows an alert is already up.
+   *
+   * The gateway sends AT MOST ONE of these per poll and marks the note
+   * before sending, so this never arrives twice for the same note and never
+   * arrives in a burst.
+   */
+  onNoteDue?: (note: NoteDue) => void
+  /**
    * Translate mode turned on or off, or a start was rejected.
    *
    * Fires on every translate_start, translate_stop and translate_status,
@@ -280,6 +303,36 @@ export interface TimerCommand {
   title?: string
   durationS?: number
   /** Seconds the full-screen alert box holds. Undefined = client default. */
+  alertS?: number
+}
+
+/**
+ * A note whose due time has passed, from {"type":"note_due"}.
+ *
+ * `alertS` is a HOLD, not a duration to count down - the deadline has
+ * already gone by, and nothing here is timed against the phone clock. That
+ * is why this carries no equivalent of TimerCommand.durationS and needs
+ * none of its reasoning about unsynchronised clocks: the gateway did the
+ * date arithmetic against its own clock, which is where the note's due date
+ * was resolved in the first place.
+ *
+ * `id` is the note's store id, carried so a future build can act on the
+ * note from the alert - ticking it off with a tap rather than only
+ * dismissing it. Nothing reads it today beyond logging, and it is here now
+ * because adding it later would mean a gateway change to get it.
+ *
+ * `due` is the RAW stored ISO string, in one of the two shapes
+ * duedates.py emits ("2026-08-28" or "2026-08-28T14:00:00"). Unformatted on
+ * purpose: the gateway's format_due() exists for list rows that must fit a
+ * date beside a title in 64 characters, and the alert page has the whole
+ * lens.
+ */
+export interface NoteDue {
+  id: string
+  title: string
+  /** ISO-8601, naive local time. May be date-only. */
+  due: string | null
+  /** Seconds the full-screen alert holds. Undefined = client default. */
   alertS?: number
 }
 
@@ -652,6 +705,29 @@ export function startSttStream(
             title: typeof msg.title === 'string' ? msg.title : undefined,
             durationS:
               typeof msg.duration_s === 'number' ? msg.duration_s : undefined,
+            alertS: typeof msg.alert_s === 'number' ? msg.alert_s : undefined,
+          })
+          break
+
+        case 'note_due':
+          // A deadline the wearer set has arrived. Unsolicited: there is no
+          // exchange open and no 'answer' frame follows this one, unlike
+          // 'timer' - so main.ts putting the alert on the lens is the whole
+          // of what happens.
+          //
+          // `alert_s` is passed through UNVALIDATED, same rule as 'suggest',
+          // 'timer' and 'translation': clamping and the fallback live in the
+          // module that owns the lens, so one place decides what a hold may
+          // be. This module's job is to hand the frame's fields to the hook,
+          // not to police them.
+          console.log(
+            `[stt] note due ${msg.id} due=${msg.due ?? '-'} ` +
+              `alert=${msg.alert_s ?? 'default'}s: ${msg.title}`,
+          )
+          hooks.onNoteDue?.({
+            id: typeof msg.id === 'string' ? msg.id : '',
+            title: typeof msg.title === 'string' ? msg.title : '',
+            due: typeof msg.due === 'string' ? msg.due : null,
             alertS: typeof msg.alert_s === 'number' ? msg.alert_s : undefined,
           })
           break
