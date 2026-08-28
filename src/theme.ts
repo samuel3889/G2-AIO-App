@@ -450,6 +450,14 @@ export const PANEL_ORDER = {
   sessions: 10,
   /** Review (review.ts). */
   review: 20,
+  /**
+   * Notes (notes.ts).
+   *
+   * Between Review and the prompt library: notes are a thing you READ
+   * and fix, like a saved conversation, rather than configuration that
+   * shapes a future recording.
+   */
+  notes: 25,
   /** Suggestion prompts (prompts.ts). */
   prompts: 30,
   /**

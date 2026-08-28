@@ -382,7 +382,13 @@ export function startSttStream(
   // a list needs the array, and joining it into one string then re-splitting
   // in main.ts would throw away the structure the gateway already computed.
   // Omit it and behaviour is exactly as before.
-  onLines?: (lines: string[]) => void,
+  // `ids` is present ONLY on the notes list, and its presence is the
+  // signal that the list is ACTIONABLE. ids[i] belongs to lines[i+1] -
+  // the header has no note behind it. Plex and Sparky send lines with
+  // no ids and stay read-only, which is why this is an optional second
+  // parameter rather than a separate callback: one page builder, one
+  // frame shape, one branch in main.ts.
+  onLines?: (lines: string[], ids?: string[]) => void,
   // Optional 5th arg: conversate session callbacks. Grouped into one object
   // rather than added as a 6th and 7th positional parameter.
   hooks: SttHooks = {},
@@ -708,7 +714,14 @@ export function startSttStream(
             overlay = msg.text
             if (overlayTimer !== null) clearTimeout(overlayTimer)
             overlayTimer = null // no auto-dismiss: the user scrolls it
-            onLines(msg.lines)
+            // Passed through UNVALIDATED beyond the type check: main.ts
+            // is what pairs ids to rows and it re-checks the pairing
+            // before acting on a tap, so a short or malformed array
+            // costs a refetch there rather than a wrong note here.
+            onLines(
+              msg.lines,
+              Array.isArray(msg.ids) ? (msg.ids as string[]) : undefined,
+            )
           } else {
             overlay = 'answer'
             emitAssistant('answer', msg.text ?? '')

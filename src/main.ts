@@ -41,7 +41,13 @@ import {
   resolveHoldMs,
 } from './suggest'
 import { assistantBox, OVERLAY_Q_ID, OVERLAY_NAME } from './overlay'
-import { showMenuPage, MENU_ACTIONS, menuLabels, type MenuAction } from './menu'
+import {
+  menuContainer,
+  menuLabels,
+  actionForItemId,
+  LAUNCH_MENU_STATE,
+  type MenuAction,
+} from './menu'
 import { mountSessions, setLiveSession, refreshSessions } from './sessions'
 import {
   mountTranslate,
@@ -53,6 +59,8 @@ import { showTranslatePage, readMs, type LensTranslation } from './translatepage
 import { mountTabs } from './tabs'
 import { mountReview } from './review'
 import { mountPrompts } from './prompts'
+import { mountNotes } from './notes'
+import { restUrl } from './api'
 import {
   statusContainers,
   setDeviceStatus,
@@ -87,7 +95,7 @@ import {
 // Review. The two are different modes of the device - the gateway refuses to
 // caption and translate at once - so putting them in one scrolling column
 // would suggest they compose.
-const tabs = mountTabs(['Live', 'Conversations', 'Translate'])
+const tabs = mountTabs(['Live', 'Conversations', 'Notes', 'Translate'])
 
 // The full tuning panel, minus anything that belongs beside its own feature.
 // translate_hold_s is mounted on the Translate tab instead, further down.
@@ -136,6 +144,39 @@ try {
 // first render.
 const INITIAL_CONTENT = 'Listening…'
 
+// --- contextual menu plumbing -------------------------------------------
+//
+// THE MENU IS DECLARED WITH THE PAGE. `menuObject` is replaced wholesale on
+// every create/rebuild and is never merged, and a rebuild that OMITS it
+// CLEARS the custom items - omission is significant, not neutral.
+//
+// This app rebuilds the page from eight different places (captions, home, the
+// two list paths, the alert box, translate, the assistant overlay, notes), and
+// every one of them would have to remember to carry the menu forward. One
+// forgotten call site is not a visible bug at the call site: it is a menu that
+// silently empties itself two pages later.
+//
+// So the menu is attached HERE instead, by wrapping the bridge. Page builders
+// keep taking `{ rebuildPageContainer }` and stay unaware of the menu; they are
+// handed `lensBridge` rather than `bridge` and the menu rides along.
+//
+// `menuObject` is only filled in when the caller did not set one, so a future
+// page that wants its own menu can still override it.
+function withMenu(container: RebuildPageContainer): RebuildPageContainer {
+  if (container.menuObject === undefined) {
+    container.menuObject = menuContainer(menuState())
+  }
+  return container
+}
+
+// Structurally compatible with the `{ rebuildPageContainer }` parameter every
+// page builder declares, so nothing in pages.ts / listpage.ts /
+// translatepage.ts had to change.
+const lensBridge = {
+  rebuildPageContainer: (container: RebuildPageContainer): Promise<boolean> =>
+    bridge.rebuildPageContainer(withMenu(container)),
+}
+
 // THE LAUNCH PAGE IS BLANK: the status strip and nothing else.
 //
 // homeContainer() is the invisible full-screen container underneath it. It is
@@ -151,10 +192,16 @@ const INITIAL_CONTENT = 'Listening…'
 // a numeric result code rather than the boolean rebuildPageContainer gives.
 const startupText = [homeContainer(), ...statusContainers()]
 
+// LAUNCH_MENU_STATE, not menuState(). This runs at module top level, ABOVE
+// the `let sessionActive` / `micOn` / `translatePair` declarations further down
+// this file - calling menuState() here would be a temporal dead zone crash, not
+// a stale label. The menu is re-declared from live state a few lines below,
+// once the mic is up.
 const created = await bridge.createStartUpPageContainer(
   new CreateStartUpPageContainer({
     containerTotalNum: startupText.length,
     textObject: startupText,
+    menuObject: menuContainer(LAUNCH_MENU_STATE),
   }),
 )
 if (created !== 0) {
@@ -201,7 +248,7 @@ let suggestTimer: number | null = null
  * whole point. isBandVisible() is what the band SHOULD be; this is what was
  * actually built. They diverge whenever the flag changes while a rebuild is
  * already in flight, which is the normal case at session start:
- * runMenuSelection() calls toggleSession() and then showCaptions()
+ * runMenuAction() calls toggleSession() and then showCaptions()
  * immediately, but startSession() only SENDS the command - the gateway's
  * 'session' frame confirming it lands during that rebuild.
  *
@@ -234,7 +281,7 @@ let renderTimer: number | null = null
 let currentNames = ''
 let currentText = INITIAL_CONTENT
 
-// Which page is on the lens. In 'home', 'list' and 'menu' modes the
+// Which page is on the lens. In 'home' and 'list' modes the
 // transcript container does not exist, so textContainerUpgrade would target a
 // container that is not on the page — every caption render must be
 // suppressed until we rebuild.
@@ -257,7 +304,7 @@ let currentText = INITIAL_CONTENT
 // bypasses all four while translating anyway, so this is belt and braces —
 // but a frame in flight when the mode changed would otherwise land on a page
 // whose transcript container does not exist.
-type PageMode = 'home' | 'transcript' | 'list' | 'menu' | 'alert' | 'translate'
+type PageMode = 'home' | 'transcript' | 'list' | 'alert' | 'translate'
 let pageMode: PageMode = 'home'
 
 // --- translate mode, mirrored from the gateway --------------------------
@@ -368,6 +415,20 @@ let assistantReturnTo: PageMode = 'home'
  * without a copy of the lines there is nothing to return to.
  */
 let lastListLines: string[] | null = null
+
+/**
+ * Note ids for the list on the lens, or null when the list is read-only.
+ *
+ * ids[i] belongs to lastListLines[i + 1] - the header is not a note. Its
+ * PRESENCE is what makes the page actionable: the notes list arrives with
+ * ids, Plex and Sparky lists do not, and that is the only difference
+ * between an actionable list page and a read-only one.
+ *
+ * Kept in step with lastListLines by every path that sets either. They are
+ * two halves of one value and a set of one without the other is a bug -
+ * which is why noteIdAt() re-checks the pairing rather than trusting it.
+ */
+let lastNoteIds: string[] | null = null
 
 function scheduleGlassesRender() {
   if (pageMode !== 'transcript') return
@@ -532,19 +593,23 @@ function setLensMessage(msg: string) {
 function hint(): string {
   if (pageMode === 'home') {
     const rec = sessionActive ? `Recording (${sessionUtterances}) · ` : ''
-    return `${rec}Home · tap for menu`
+    return `${rec}Home · tap for captions · hold for menu · double-tap to exit`
   }
   if (pageMode === 'alert') return 'Timer finished · tap to dismiss'
-  if (pageMode === 'menu') return 'Menu · scroll · tap to select · double-tap to go back'
   if (pageMode === 'list') {
     // Title comes from the header line the gateway sent, so the hint names
     // whatever is actually on the lens rather than one hardcoded source.
     const title = lastListLines?.[0] ?? 'List'
+    // The notes list has an action; every other list does not, and a
+    // hint offering one that does nothing is worse than no hint.
+    if (lastNoteIds) {
+      return `${title} · scroll · tap to tick off · double-tap to go back`
+    }
     return `${title} · scroll to browse · double-tap to go back`
   }
   const rec = sessionActive ? `Recording (${sessionUtterances}) · ` : ''
   const mic = micOn ? 'Microphone live' : 'Paused'
-  return `${rec}${mic} · tap to ${micOn ? 'pause' : 'resume'} · double-tap for menu`
+  return `${rec}${mic} · tap to ${micOn ? 'pause' : 'resume'} · hold for menu`
 }
 
 function refreshStatus() {
@@ -576,12 +641,16 @@ try {
     },
     // Structured answer — Plex activity, a Sparky card — rendered as a
     // scrollable OS list. lines[0] is the HEADER, not an item.
-    async lines => {
+    async (lines, ids) => {
       // Kept so restoreFromAssistant() can rebuild this exact list. The page
       // is a rebuild like any other and the SDK gives no way to read a
       // container's contents back, so the only copy of what was on the lens
       // is the one we keep here.
       lastListLines = lines
+      // Set TOGETHER with the lines, always, including to null. A list
+      // arriving without ids after one that had them must clear these, or
+      // a tap on the Plex page would mark a note done.
+      lastNoteIds = ids && ids.length ? ids : null
       // The list page IS the handover out of the assistant exchange, so the
       // assistant state is cleared HERE rather than by an onAssistant(null)
       // from stt.ts. That null used to arrive one statement before this
@@ -594,7 +663,7 @@ try {
       // until the build succeeds, and scheduleGlassesRender()'s own re-check
       // catches the switch.
       assistant = null
-      const ok = await showListPage(bridge, lines)
+      const ok = await showListPage(lensBridge, lines)
       if (!ok) {
         // rebuildPageContainer returns boolean, NOT the numeric result code
         // createStartUpPageContainer gives - `!ok`, not `!== 0`.
@@ -905,10 +974,20 @@ void mountSettings(tabs.Translate, {
 // gateway over REST, so a failed socket leaves prompt editing working.
 void mountPrompts(tabs.Conversations)
 
+// Notes, on their OWN tab. REST only, so the panel works with the glasses
+// disconnected and with the socket down - a failed socket leaves note
+// editing working, exactly as it does for the prompt library.
+void mountNotes(tabs.Notes)
+
 if (stt) {
   await bridge.audioControl(true)
   micOn = true
   refreshStatus()
+  // Re-declare the menu now that micOn is true. The startup page was built
+  // from LAUNCH_MENU_STATE, whose `micOn: false` produced a "Resume mic" item
+  // that would otherwise sit there lying about the mic until the first page
+  // change. One rebuild of the same blank home page.
+  await refreshMenu()
 }
 
 /**
@@ -932,7 +1011,7 @@ async function renderAssistant(s: AssistantState) {
   // variable the last overlay probe was left waiting on.
   const text = [...boxes, ...statusContainers()]
 
-  const ok = await bridge.rebuildPageContainer(
+  const ok = await lensBridge.rebuildPageContainer(
     new RebuildPageContainer({
       containerTotalNum: text.length,
       textObject: text,
@@ -993,7 +1072,7 @@ async function showCaptions() {
   // record claim an outline the page was never built with.
   const builtWithBorder = builtWithBand && currentSuggestion !== ''
   const ok = await showTranscriptPage(
-    bridge,
+    lensBridge,
     currentText,
     currentNames,
     currentSuggestion,
@@ -1021,11 +1100,11 @@ async function showCaptions() {
 
   // The session state may have changed while that rebuild was in flight, in
   // which case the page just built is already stale. This is the NORMAL path
-  // at session start, not an edge case: runMenuSelection() calls
+  // at session start, not an edge case: runMenuAction() calls
   // toggleSession() and then showCaptions() immediately, and startSession()
   // only SENDS the command - the gateway's confirming 'session' frame
   // arrives during this rebuild, too late for the page and too early for the
-  // onSession handler to act on (pageMode was still 'menu').
+  // onSession handler to act on (the rebuild had not landed yet).
   //
   // One corrective pass. It cannot loop: the second call captures the flag
   // as it now is, and only another session frame could move it again.
@@ -1060,7 +1139,7 @@ async function showCaptions() {
  */
 async function showHome() {
   console.log(`[page] home (from ${pageMode})`)
-  const ok = await showHomePage(bridge)
+  const ok = await showHomePage(lensBridge)
   if (!ok) {
     setStatus('error', 'rebuildPageContainer failed (home)')
     console.error('Failed to build home page')
@@ -1116,9 +1195,6 @@ async function returnToPage(mode: PageMode) {
     case 'home':
       await showHome()
       break
-    case 'menu':
-      await showMenu()
-      break
     case 'translate':
       // Reachable when an assistant box or a timer alert interrupted the
       // translate page. `lensLine` may have been cleared by its hold while
@@ -1130,7 +1206,7 @@ async function returnToPage(mode: PageMode) {
       // No retained lines means the list was never built in this session —
       // fall through to captions rather than rebuild an empty list.
       if (lastListLines) {
-        const ok = await showListPage(bridge, lastListLines)
+        const ok = await showListPage(lensBridge, lastListLines)
         if (!ok) {
           setStatus('error', 'rebuildPageContainer failed (list)')
           console.error('Failed to rebuild list page')
@@ -1198,7 +1274,7 @@ async function showTimerAlert(t: TimerState) {
     `[timer] alert "${t.title}" for ${t.alertS}s (returning to ${alertReturnTo})`,
   )
 
-  const ok = await showAlertPage(bridge, t.title)
+  const ok = await showAlertPage(lensBridge, t.title)
   if (!ok) {
     setStatus('error', 'rebuildPageContainer failed (alert)')
     console.error('Failed to build alert page')
@@ -1296,7 +1372,7 @@ onTimerExpired(t => {
  * than at each call site.
  */
 async function showTranslate() {
-  const ok = await showTranslatePage(bridge, lensLine ?? {
+  const ok = await showTranslatePage(lensBridge, lensLine ?? {
     text: '',
     from: translatePair.a,
     to: translatePair.b,
@@ -1392,10 +1468,13 @@ async function endTranslateOnLens() {
 /**
  * The state the menu draws itself from.
  *
- * ONE builder, used by both showMenu() and runMenuSelection(). They have to
- * agree: the selection maps an INDEX back to an action by matching the label
- * the OS reported against menuLabels(), so a state that differed between the
- * two would map a tap to the wrong item.
+ * ONE builder, read by withMenu() every time a page is rebuilt. Every menu the
+ * glasses hold was declared from this, so what the wearer reads on an item is
+ * whatever this returned at the last rebuild - see refreshMenu().
+ *
+ * A stale label can no longer select the wrong action the way the old list
+ * page could: selection now comes back as a stable itemID rather than as a row
+ * index resolved against menuLabels().
  *
  * `translatePair` comes from the phone panel's last used pair rather than
  * from `translatePair` here, which only holds a pair while a translation is
@@ -1412,16 +1491,26 @@ function menuState() {
   }
 }
 
-/** Rebuild the menu page. Reads current state for its labels and header. */
-async function showMenu() {
-  const ok = await showMenuPage(bridge, menuState())
-  if (!ok) {
-    setStatus('error', 'rebuildPageContainer failed (menu)')
-    console.error('Failed to build menu page')
-    return
-  }
-  pageMode = 'menu'
-  refreshStatus()
+/**
+ * Re-declare the contextual menu.
+ *
+ * MENU ITEMS ARE FIRE AND FORGET: the glasses hold whatever labels were sent
+ * with the current page and there is no path from the app back into an open
+ * menu. An item reading "Pause mic" goes on reading "Pause mic" after the mic
+ * has been paused, until the page is built again.
+ *
+ * So this rebuilds THE PAGE THAT IS ALREADY UP - returnToPage(pageMode) - and
+ * the menu rides along on that rebuild via withMenu(). Nothing on the lens
+ * changes; only the overlay the OS is holding does.
+ *
+ * Only needed after an action that flips one of the STATE-DEPENDENT labels
+ * (mic, session, translate). Actions that already rebuild the page as part of
+ * their own work - opening captions, starting a recording - get this for free
+ * and must not call it again.
+ */
+async function refreshMenu() {
+  console.log(`[menu] re-declaring on ${pageMode}: ${menuLabels(menuState()).join(' | ')}`)
+  await returnToPage(pageMode)
 }
 
 function toggleMic() {
@@ -1468,24 +1557,21 @@ function toggleSession() {
 }
 
 /**
- * Map a menu tap to an action.
+ * Run a contextual menu action.
  *
- * currentSelectItemIndex is a protobuf int32, so index 0 arrives as
- * `undefined` for exactly the same reason CLICK_EVENT does — `?? 0` is
- * load-bearing, not defensive padding. The item NAME is cross-checked
- * against the labels we built, because a name is a non-zero-value field
- * and therefore survives the wire intact.
+ * The action arrives already resolved, from actionForItemId() against the
+ * itemID the OS reported. The index-and-label matching this function used to
+ * do is gone with the list page, and with it a whole class of bug: a row index
+ * had to be resolved against menuLabels() rebuilt from CURRENT state, so a
+ * label that changed between drawing the page and tapping it could run the
+ * wrong action. An itemID is a fixed protocol number and cannot drift.
+ *
+ * There is no protobuf zero-value trap here either - itemID 0 is illegal by
+ * protocol, so an absent field genuinely means "no item" rather than "item 0",
+ * which is exactly the trap selectIndexOf() exists to work around for lists.
  */
-async function runMenuSelection(index: number | undefined, name: string | undefined) {
-  const labels = menuLabels(menuState())
-  let i = index ?? 0
-  if (name) {
-    const byName = labels.indexOf(name)
-    if (byName >= 0) i = byName
-  }
-
-  const action: MenuAction | undefined = MENU_ACTIONS[i]
-  console.log(`[menu] select index=${index} name=${name} -> ${action}`)
+async function runMenuAction(action: MenuAction) {
+  console.log(`[menu] action ${action}`)
 
   switch (action) {
     case 'captions':
@@ -1516,14 +1602,19 @@ async function runMenuSelection(index: number | undefined, name: string | undefi
       break
     case 'mic':
       toggleMic()
-      // Rebuild so the label flips to its opposite.
-      await showMenu()
+      // Re-declare so the item flips to its opposite. The menu the OS is
+      // holding still says what it said when this page was built.
+      await refreshMenu()
       break
     case 'exit':
-      // The only place in this app that shuts the container down. Long
-      // press is the normal route and never reaches us; this is the
-      // fallback if that gesture is unavailable. exitMode 1 shows the OS
-      // confirmation layer, and SYSTEM_EXIT_EVENT arrives on confirm.
+      // exitMode 1 shows the OS confirmation layer; SYSTEM_EXIT_EVENT
+      // arrives on confirm. Mode 0 (immediate) is explicitly not acceptable.
+      //
+      // NOTE this item is now REDUNDANT twice over: the OS puts its own
+      // "Close <app name>" row at the bottom of this same menu, and the root
+      // page double tap below does the same thing. It is kept because it was
+      // one of the old menu's options; delete it from MENU_ACTIONS in menu.ts
+      // and nothing else has to change.
       await bridge.shutDownPageContainer(1)
       break
     default:
@@ -1531,17 +1622,150 @@ async function runMenuSelection(index: number | undefined, name: string | undefi
   }
 }
 
-/** Double tap. Back, per platform convention — never a shutdown. */
+/**
+ * Rebuild the notes list from the gateway.
+ *
+ * Called after completing one, because the completed note leaves the list and
+ * the rows below it shift up. Nothing here re-renders the page from local
+ * state: the rows come back already formatted from /notes/lens, so the
+ * 64-character cap and the date-survives-truncation rule stay in Python where
+ * they are tested. See NoteStore.lens_view().
+ *
+ * An empty list - every note ticked off - comes back as a header with no
+ * items, and showListPage() falls through to a plain message page for that.
+ * pageMode stays 'list' so double tap still leaves the way it did.
+ */
+async function refreshNotesPage(): Promise<void> {
+  let view: { lines: string[]; ids: string[] }
+  try {
+    const r = await fetch(restUrl('/notes/lens'))
+    if (!r.ok) throw new Error(`${r.status}`)
+    view = (await r.json()) as { lines: string[]; ids: string[] }
+  } catch (e) {
+    setStatus('error', `notes refresh failed: ${(e as Error).message}`)
+    console.error('Failed to refresh notes list:', e)
+    return
+  }
+
+  lastListLines = view.lines
+  lastNoteIds = view.ids.length ? view.ids : null
+
+  const ok = await showListPage(lensBridge, view.lines)
+  if (!ok) {
+    setStatus('error', 'rebuildPageContainer failed (notes)')
+    console.error('Failed to rebuild notes list')
+    return
+  }
+  pageMode = 'list'
+  lastNames = ''
+  lastText = ''
+  refreshStatus()
+}
+
+/**
+ * Mark the tapped note done.
+ *
+ * RESOLVED BY NAME FIRST, INDEX SECOND: currentSelectItemIndex is a protobuf
+ * int32, so index 0 arrives as `undefined`, while the item NAME is a non-zero
+ * value and survives the wire intact.
+ *
+ * This is now the ONLY place in the app that has to know that rule. The menu
+ * used to be a list page and shared it; the contextual menu reports a stable
+ * itemID instead, and itemID 0 is illegal by protocol, so nothing about menu
+ * selection needs this any more.
+ *
+ * That omission was a real bug. Treating the missing index as "no selection"
+ * meant a tap on the FIRST row was silently ignored, which looked from the
+ * outside like notes with no due date being untickable - the note being tapped
+ * simply happened to be at the top of the list.
+ *
+ * The name is also the STALENESS CHECK, which the menu does not need and this
+ * does. The list on the lens is a snapshot: a note completed from the phone, or
+ * a capture landing while the page is up, changes what the gateway would build
+ * without changing what the glasses are showing. A name that matches exactly
+ * one row is trustworthy whatever index came with it. A name that matches none
+ * means the page is stale, and there is no undo on the lens - only the phone
+ * can reopen a note - so it refreshes rather than guessing.
+ *
+ * DUPLICATE TITLES fall back to the index, because two identical rows make the
+ * name useless for telling them apart and the index is then the only thing
+ * that distinguishes them.
+ */
+async function completeNoteAt(
+  reportedIndex: number | null,
+  name?: string,
+): Promise<void> {
+  const ids = lastNoteIds
+  const lines = lastListLines
+  if (!ids || !lines) return
+
+  // lines[0] is the header, so the row for ids[i] is lines[i + 1].
+  const rows = lines.slice(1)
+
+  let index = reportedIndex ?? 0
+  if (typeof name === 'string' && name.length) {
+    const hits: number[] = []
+    rows.forEach((row, i) => { if (row === name) hits.push(i) })
+    if (hits.length === 1) {
+      index = hits[0]
+    } else if (hits.length === 0) {
+      // The glasses are showing a row this page does not have. Refresh and
+      // let the wearer tap again against a list that is current.
+      const msg = `note tap ignored: ${JSON.stringify(name)} is not on this list`
+      console.warn(`[notes] ${msg}`)
+      setStatus('error', msg)
+      await refreshNotesPage()
+      return
+    }
+    // hits.length > 1: two notes with the same row text. `index` keeps the
+    // reported value, which is the only thing that separates them.
+  }
+
+  if (index < 0 || index >= ids.length) {
+    // EVERY REFUSAL REPORTS TO THE PHONE, not only to the console. The WebView
+    // console is not reachable while the app is on the glasses, so a branch
+    // that declines to act and says so only to console.warn is, from the
+    // wearer's side, indistinguishable from a dead gesture. That is exactly
+    // how the index-zero bug stayed hidden.
+    const msg = `note tap ignored: row ${index} outside 0..${ids.length - 1}`
+    console.warn(`[notes] ${msg}`)
+    setStatus('error', msg)
+    await refreshNotesPage()
+    return
+  }
+
+  const id = ids[index]
+  console.log(
+    `[notes] tick index=${reportedIndex} name=${JSON.stringify(name)} ` +
+    `-> row ${index} ${id}`,
+  )
+  try {
+    const r = await fetch(restUrl(`/notes/${id}/complete`), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ done: true }),
+    })
+    if (!r.ok) throw new Error(`${r.status}`)
+  } catch (e) {
+    const msg = `could not tick note: ${(e as Error).message}`
+    setStatus('error', msg)
+    console.error('[notes]', msg, e)
+    return
+  }
+  await refreshNotesPage()
+}
+
 async function goBack() {
   // Back out of the assistant box first — it is the topmost thing on screen.
   if (assistant !== null) {
     stt?.dismiss()
     return
   }
-  // Home is the ROOT now, and the hierarchy is home -> menu -> everything
-  // else. So "back" from a feature page goes to the menu's parent, home —
-  // never to captions, which is one of the things the menu launches rather
-  // than the page underneath it.
+  // Home is the ROOT, and every other page is one level down from it: the
+  // menu is no longer a page in the hierarchy, it is an OS overlay reachable
+  // from all of them. So "back" from a feature page goes to home — never to
+  // captions, which is one of the things the menu launches rather than the
+  // page underneath it.
   // Double tap ENDS TRANSLATE MODE rather than merely leaving the page.
   // Leaving would strand the gateway translating with nothing on the lens
   // to show for it, and the only way back would be the phone. The gateway's
@@ -1553,11 +1777,17 @@ async function goBack() {
     return
   }
   if (pageMode === 'home') {
-    // Nothing above home. The only useful thing a gesture can do here is open
-    // the menu, and both gestures do it rather than one of them being dead.
-    await showMenu()
-  } else if (pageMode === 'transcript') {
-    await showMenu()
+    // ROOT PAGE. Double tap here MUST call shutDownPageContainer(1) — the
+    // system exit confirmation. This is a submission requirement, not a
+    // preference: mode 0 (immediate exit) and any in-app confirmation UI of
+    // our own are both rejected on the root page, as is doing nothing.
+    //
+    // It used to open the menu. That was only ever defensible under the
+    // pattern where the menu it opened contained an Exit item; with the menu
+    // moved to the OS overlay there is nothing left on this gesture, so it
+    // goes back to being the exit it is supposed to be.
+    console.log('[gesture] double-tap on root -> system exit dialog')
+    await bridge.shutDownPageContainer(1)
   } else {
     await showHome()
   }
@@ -1607,12 +1837,42 @@ function eventTypeOf(envelope?: { eventType?: OsEventTypeList }): OsEventTypeLis
   return envelope.eventType ?? OsEventTypeList.CLICK_EVENT
 }
 
+// Reads the selected row out of a list envelope.
+//
+// THE SAME PROTOBUF TRAP AS eventTypeOf ABOVE, and it cost a real bug:
+// index 0 is a zero value, protobuf omits zero-value fields on the wire,
+// so a tap on the FIRST row of a list arrives with
+// `currentSelectItemIndex` undefined. Code that treats undefined as "no
+// index" silently ignores every tap on the top row - which showed up as
+// notes without a due date not ticking off, because the note being tapped
+// happened to be the first one.
+//
+// Resolved INSIDE the envelope check, exactly as eventTypeOf does. A
+// missing envelope still means no index - a tap that never reached the
+// list at all must not be read as a tap on row zero.
+//
+// Defaulting to 0 is only safe because the caller re-checks the reported
+// LABEL against the row it believes is at that index; see completeNoteAt().
+// Without that check this would turn a stray envelope into a tick on the
+// wrong note.
+function selectIndexOf(
+  envelope?: { currentSelectItemIndex?: number },
+): number | null {
+  if (!envelope) return null
+  return envelope.currentSelectItemIndex ?? 0
+}
+
 // Event routing.
 //
-// Gestures, per platform convention:
-//   single tap -> select
-//   double tap -> back
-//   long press -> shut down, consumed by the OS. There is NO long-press
+// Gestures:
+//   single tap        -> select
+//   double tap        -> back, and on the ROOT page the system exit dialog
+//   tap then long press -> the OS raises the CONTEXTUAL MENU. The gesture
+//                 itself never reaches us; we see the overlay opening as
+//                 FOREGROUND_ENTER_EVENT, a selection as
+//                 menuItemClickEvent, and the overlay closing as
+//                 FOREGROUND_EXIT_EVENT.
+//   long press    -> shut down, consumed by the OS. There is NO long-press
 //                 value in OsEventTypeList, so it never arrives here; we
 //                 only see the aftermath as SYSTEM_EXIT_EVENT.
 //
@@ -1621,6 +1881,30 @@ function eventTypeOf(envelope?: { eventType?: OsEventTypeList }): OsEventTypeLis
 const unsubscribe = bridge.onEvenHubEvent(event => {
   const pcm = event.audioEvent?.audioPcm
   if (pcm) stt?.sendPcm(pcm)
+
+  // THE CONTEXTUAL MENU IS ITS OWN TOP-LEVEL EVENT FIELD.
+  //
+  // It does NOT route through isEventCapture the way list and text events do,
+  // so it arrives whichever container is capturing and on whichever page is
+  // up — which is why it is handled here, above every pageMode branch below,
+  // rather than inside one of them. The alert box owns every ordinary gesture
+  // while it is up; it does not own this one.
+  //
+  // No `?? 0` fallback, deliberately: itemID 0 is illegal by protocol, so an
+  // absent field means no item rather than the first item. This is the exact
+  // opposite of the list-index rule in selectIndexOf() below.
+  const menuItemId = event.menuItemClickEvent?.itemID
+  if (menuItemId !== undefined) {
+    const action = actionForItemId(menuItemId)
+    if (!action) {
+      const msg = `menu itemID ${menuItemId} is not one this page declared`
+      console.warn(`[menu] ${msg}`)
+      setStatus('error', msg)
+      return
+    }
+    void runMenuAction(action)
+    return
+  }
 
   const sysType = eventTypeOf(event.sysEvent)
   const textType = eventTypeOf(event.textEvent)
@@ -1664,6 +1948,24 @@ const unsubscribe = bridge.onEvenHubEvent(event => {
     return
   }
 
+  // The contextual menu opening and closing arrives as ordinary foreground
+  // events on the page underneath it.
+  //
+  // FOREGROUND_EXIT_EVENT HERE DOES NOT MEAN THE APP WAS TORN DOWN. The page
+  // stays mounted and owns the screen the whole time the overlay is up, so
+  // nothing destructive belongs on this branch — no stopping timers, no
+  // dropping the socket. Teardown is SYSTEM_EXIT_EVENT / ABNORMAL_EXIT_EVENT
+  // at the bottom of this handler, and that has not changed.
+  if (
+    sysType === OsEventTypeList.FOREGROUND_ENTER_EVENT ||
+    sysType === OsEventTypeList.FOREGROUND_EXIT_EVENT
+  ) {
+    console.log(
+      `[menu] overlay ${sysType === OsEventTypeList.FOREGROUND_ENTER_EVENT ? 'opened' : 'closed'} over ${pageMode}`,
+    )
+    return
+  }
+
   // Scrolling is handled by the OS - the list moves itself and reports
   // afterwards. Logged only, so the selected index is visible while
   // tuning itemCount. Deliberately does NOT rebuild the page: doing so
@@ -1672,6 +1974,10 @@ const unsubscribe = bridge.onEvenHubEvent(event => {
     listType === OsEventTypeList.SCROLL_TOP_EVENT ||
     listType === OsEventTypeList.SCROLL_BOTTOM_EVENT
   ) {
+    // RAW index here, deliberately - not selectIndexOf(). Anything that
+    // ACTS on a selection goes through the helper; a diagnostic wants to
+    // show what the wire actually carried, and silently printing 0 where
+    // the field was absent would hide the exact thing this log is for.
     console.log(
       `[${pageMode}] scroll ${listType === OsEventTypeList.SCROLL_TOP_EVENT ? 'up' : 'down'} ->`,
       event.listEvent?.currentSelectItemIndex,
@@ -1692,19 +1998,25 @@ const unsubscribe = bridge.onEvenHubEvent(event => {
       return
     }
 
-    if (pageMode === 'menu') {
-      void runMenuSelection(
-        event.listEvent?.currentSelectItemIndex,
-        event.listEvent?.currentSelectItemName,
-      )
-    } else if (pageMode === 'list') {
-      // Nothing to select in a read-only list. Logged so the index is
-      // visible; double tap is how you leave.
-      console.log(
-        '[list] select ->',
-        event.listEvent?.currentSelectItemIndex,
-        event.listEvent?.currentSelectItemName,
-      )
+    if (pageMode === 'list') {
+      if (lastNoteIds) {
+        // The NOTES list. One tap ticks the selected note off, and that
+        // is the only action this page has - deleting is the phone's job,
+        // deliberately, because nothing on the lens can undo it.
+        void completeNoteAt(
+          selectIndexOf(event.listEvent),
+          event.listEvent?.currentSelectItemName,
+        )
+      } else {
+        // Any other list - Plex, a Sparky card - carries no ids and has
+        // nothing to select. Logged so the index is visible; double tap
+        // is how you leave.
+        console.log(
+          '[list] select ->',
+          event.listEvent?.currentSelectItemIndex,
+          event.listEvent?.currentSelectItemName,
+        )
+      }
     } else if (pageMode === 'translate') {
       // A single tap does NOTHING here, deliberately.
       //
@@ -1716,13 +2028,17 @@ const unsubscribe = bridge.onEvenHubEvent(event => {
       console.log('[translate] tap ignored — double-tap to end')
     } else if (pageMode === 'home') {
       // The home page shows nothing, so there is nothing on it to act on.
-      // Tap opens the menu — the same thing double tap does, because a blank
-      // page with one dead gesture is indistinguishable from a hung one.
+      //
+      // This used to open the menu; the menu is now an OS overlay on tap then
+      // long press, from any page including this one. Leaving the tap dead
+      // would make a blank page indistinguishable from a hung one, so it goes
+      // to captions — the page this app is for, and the one the old menu's
+      // first item opened.
       //
       // NOT toggleMic(): the mic state is invisible from here, so a tap that
       // silently paused capture would be discoverable only by its
       // consequences.
-      void showMenu()
+      void showCaptions()
     } else {
       // Caption mode: tap is the primary action, and the primary action
       // here is pausing capture.

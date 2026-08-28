@@ -44,6 +44,10 @@ const TAB_ICONS: Record<string, string> = {
   Review: 'headset',
   Settings: 'sliders',
   Prompts: 'doc',
+  // A luggage tag rather than a page: the Conversations tab already
+  // uses a speech bubble and the notes CARD uses 'doc', so a third
+  // document-shaped glyph in the nav would read as a duplicate.
+  Notes: 'tag',
 }
 
 const hosts: Record<string, HTMLElement> = {}
