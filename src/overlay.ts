@@ -1,11 +1,16 @@
 /**
- * Assistant overlay box.
+ * Assistant overlay: a dim question with a bright answer under it.
  *
- * ONE box. It is drawn around the question as soon as there is one, and it
- * GROWS downward as "Thinking…" and then the answer are appended to the same
- * container. Previously this returned two stacked containers; a single one
- * is what makes it read as one growing box rather than a box that spawns a
- * second box underneath it.
+ * TWO containers again, and this time for a reason the SDK forces. Brightness
+ * is `textColor` on TextContainerProperty and it is a property of a
+ * CONTAINER, not of text - the same constraint the teleprompter runs into.
+ * So "my speech dim, the reply full brightness" is only expressible as two
+ * containers, whatever it costs in layout.
+ *
+ * The question is BORDERLESS and dim; only the answer carries a border. That
+ * keeps the pair reading as one exchange rather than two boxes: what is
+ * framed is the thing worth reading, and what the wearer already said sits
+ * quietly above it as context.
  *
  * The page this box goes on carries NOTHING ELSE — main.ts no longer puts
  * the transcript underneath it, so whatever was on the lens disappears for
@@ -37,8 +42,8 @@ import { STATUS_H } from './statusbar'
 
 // Container IDs. 1 transcript, 2/3 plex, 4/5 menu, 6 overlay.
 export const OVERLAY_Q_ID = 6
-// No longer used: the answer shares the question's container. Kept reserved
-// so nothing else claims 7 and collides if a second box ever comes back.
+// In use again: the answer needs its own container to carry its own
+// brightness. See assistantBox().
 export const OVERLAY_A_ID = 7
 
 // containerName is capped at 16 characters. Exported because
@@ -46,6 +51,9 @@ export const OVERLAY_A_ID = 7
 // two copies of the string would drift apart and the upgrade would silently
 // target nothing.
 export const OVERLAY_NAME = 'assist'
+
+/** Name of the answer container. Also capped at 16 characters. */
+export const OVERLAY_A_NAME = 'assistA'
 
 const SCREEN_W = 576
 const SCREEN_H = 288
@@ -230,58 +238,113 @@ function answerText(s: AssistantState): string {
 }
 
 /**
- * Build the overlay container for the current assistant state.
+ * Brightness of the wearer's own words, 0-4.
  *
- * Returns an ARRAY of exactly one box. The array shape is kept because
- * main.ts spreads it into textObject and derives containerTotalNum from its
- * length — returning a bare container would mean changing both, for no gain.
+ * 0, the floor. What the wearer said is CONTEXT - they already know it, and
+ * they are waiting on the reply. Keeping it on the lens at all is so they
+ * can check what was heard when an answer looks wrong; it does not need to
+ * compete with the answer for attention.
+ */
+const Q_BRIGHTNESS = 0
+
+/** Brightness of the reply. The ceiling - this is the thing being read. */
+const A_BRIGHTNESS = 4
+
+/** Vertical gap between the question and the answer box. */
+const PAIR_GAP = 6
+
+/**
+ * Lines of question kept before it is trimmed.
  *
- * The box is sized to its content, so it grows in place across the phases:
- * question -> question + "Thinking…" -> question + answer.
+ * A rambling question must not eat the space the answer needs. Three lines
+ * is enough to recognise what was heard, which is the only job it has.
+ */
+const MAX_Q_LINES = 3
+
+/** Trim `text` to at most `lines`, with an ellipsis when it was cut. */
+function clampText(text: string, lines: number): string {
+  if (lines < 1) return ''
+  if (countLines(text) <= lines) return text
+  // Cut by CHARACTERS rather than lines: countLines is an estimate, and a
+  // hard character budget cannot overshoot the way a line-based cut can.
+  return `${text.slice(0, lines * CHARS_PER_LINE - 1).trimEnd()}…`
+}
+
+/**
+ * Build the overlay containers for the current assistant state.
+ *
+ * Returns ONE container while there is nothing to reply with yet, and TWO
+ * once there is - the question above, dim and borderless, and the answer
+ * below it in a bordered box at full brightness.
+ *
+ * main.ts spreads the array into textObject, derives containerTotalNum from
+ * its length, and upgrades every entry, so a second box needs no change
+ * there beyond upgrading all of them rather than the first.
  */
 export function assistantBox(s: AssistantState): TextContainerProperty[] {
-  const qText = questionText(s)
+  const avail = MAX_BOX_BOTTOM - BOX_TOP
+  const linesFor = (px: number) =>
+    Math.max(0, Math.floor((px - BOX_PADDING * 2) / LINE_HEIGHT))
+
   const aText = answerText(s)
 
-  // A blank line between the two so the reply is visually separate from the
-  // question without a second border to separate it.
-  const body = aText ? `${qText}\n\n${aText}` : qText
+  // The question is trimmed FIRST and to a fixed ceiling, so the answer's
+  // budget does not depend on how long-winded the question was.
+  const qShown = clampText(
+    questionText(s),
+    aText ? Math.min(MAX_Q_LINES, linesFor(avail)) : linesFor(avail),
+  )
+  const qHeight = Math.min(boxHeight(qShown), avail)
 
-  // Clamp: trim until the box fits above the bottom margin.
-  const avail = MAX_BOX_BOTTOM - BOX_TOP
-  const maxLines = Math.max(1, Math.floor((avail - BOX_PADDING * 2) / LINE_HEIGHT))
-  let shown = body
-  if (countLines(shown) > maxLines) {
-    // Cut by characters rather than lines: countLines is an estimate, and
-    // slicing to a hard character budget cannot overshoot the way a
-    // line-based cut can.
-    shown = `${body.slice(0, maxLines * CHARS_PER_LINE - 1).trimEnd()}…`
-  }
+  const question = new TextContainerProperty({
+    xPosition: BOX_MARGIN_X,
+    yPosition: BOX_TOP,
+    width: BOX_W,
+    height: qHeight,
+    // NO BORDER on the question. One frame per exchange, around the answer.
+    borderWidth: 0,
+    borderColor: BOX_BORDER_COLOR,
+    borderRadius: 4,
+    paddingLength: BOX_PADDING,
+    containerID: OVERLAY_Q_ID,
+    containerName: OVERLAY_NAME,
+    // `content` must be passed here even though main.ts follows the rebuild
+    // with a textContainerUpgrade: the upgrade reads it back off this
+    // object, so a container built without it sends '' too and draws empty.
+    content: qShown,
+    textColor: Q_BRIGHTNESS,
+    zOrderIndex: zFor(0, 2),
+    // Capture goes to the ANSWER when there is one - see below - so this
+    // holds it only while the question is alone on the page.
+    isEventCapture: aText ? 0 : 1,
+  })
 
-  return [
-    new TextContainerProperty({
-      xPosition: BOX_MARGIN_X,
-      yPosition: BOX_TOP,
-      width: BOX_W,
-      height: Math.min(boxHeight(shown), avail),
-      borderWidth: 2,
-      borderColor: BOX_BORDER_COLOR,
-      borderRadius: 4,
-      paddingLength: BOX_PADDING,
-      containerID: OVERLAY_Q_ID,
-      containerName: OVERLAY_NAME,
-      // `content` must be passed here even though main.ts follows the
-      // rebuild with a textContainerUpgrade: that upgrade reads
-      // `boxes[0].content`, so a container built without it sends '' too
-      // and the box draws empty.
-      content: shown,
-      // Only container on the overlay page, so depth 0 of 1.
-      zOrderIndex: zFor(0, 1),
-      // Exactly one container per page captures events, and while the
-      // overlay is up it must be this one - so a tap dismisses the box.
-      isEventCapture: 1,
-    }),
-  ]
+  if (!aText) return [question]
+
+  const aTop = BOX_TOP + qHeight + PAIR_GAP
+  const aAvail = MAX_BOX_BOTTOM - aTop
+  const aShown = clampText(aText, linesFor(aAvail))
+
+  const answer = new TextContainerProperty({
+    xPosition: BOX_MARGIN_X,
+    yPosition: aTop,
+    width: BOX_W,
+    height: Math.min(boxHeight(aShown), aAvail),
+    borderWidth: 2,
+    borderColor: BOX_BORDER_COLOR,
+    borderRadius: 4,
+    paddingLength: BOX_PADDING,
+    containerID: OVERLAY_A_ID,
+    containerName: OVERLAY_A_NAME,
+    content: aShown,
+    textColor: A_BRIGHTNESS,
+    zOrderIndex: zFor(1, 2),
+    // Exactly one container per page captures events, and while the overlay
+    // is up it must be one of these - so a tap dismisses the box.
+    isEventCapture: 1,
+  })
+
+  return [question, answer]
 }
 
 /**

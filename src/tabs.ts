@@ -48,6 +48,8 @@ const TAB_ICONS: Record<string, string> = {
   // uses a speech bubble and the notes CARD uses 'doc', so a third
   // document-shaped glyph in the nav would read as a duplicate.
   Notes: 'tag',
+  Translate: 'globe',
+  Teleprompt: 'prompter',
 }
 
 const hosts: Record<string, HTMLElement> = {}

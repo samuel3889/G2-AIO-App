@@ -128,11 +128,24 @@ body { display: flex; flex-direction: column; }
 }
 .g2-sep   { color: var(--text-3); font-size: 11px; }
 .g2-crumb { font: 650 12px/1 var(--font); color: var(--text); }
-.g2-appbar .spacer { flex: 1 1 auto; }
+/* Was flex:1, which pushed the status hard right and left it whatever was
+   over. It now yields instead, so the status gets the space it needs and the
+   spacer only fills what is genuinely spare. */
+.g2-appbar .spacer { flex: 0 1 auto; min-width: 8px; }
+/* The lens hint mirror. It carries strings as long as
+   "HOME * TAP FOR CAPTIONS * HOLD FOR MENU * DOUBLE-TAP TO EXIT", which at
+   44% of a phone width and a single nowrap line was clipped to "HOME * TAP
+   FOR CAPTIONS * H...".
+
+   Now it WRAPS to two lines and takes the whole width left over by the
+   breadcrumb, which is affordable because the duplicate chip that used to
+   sit in the Live captions card header is gone - see ui.ts. Clamped at two
+   lines so a long status can never grow the bar without limit. */
 .g2-conn {
-  font: 600 10px/1 var(--font); letter-spacing: .06em; text-transform: uppercase;
-  color: var(--text-3); white-space: nowrap; max-width: 44%;
-  overflow: hidden; text-overflow: ellipsis;
+  font: 600 10px/1.3 var(--font); letter-spacing: .06em; text-transform: uppercase;
+  color: var(--text-3); text-align: right; min-width: 0;
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
+  overflow: hidden;
 }
 .g2-conn.ok  { color: var(--accent); }
 .g2-conn.bad { color: var(--danger); }
@@ -359,6 +372,18 @@ const ICONS: Record<string, string> = {
   mic:      '<rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3"/>',
   reset:    '<path d="M3 12a9 9 0 1 0 2.6-6.4"/><path d="M3 4v5h5"/>',
 
+  // Added for the nav, which was falling back to a plain dot for two tabs.
+  //
+  // A GLOBE for Translate rather than any lettering: the tab is a language
+  // PAIR chosen by the wearer, so "A/文" would be wrong for most of the
+  // pairs the picker offers, and at nav size two glyphs are unreadable
+  // anyway.
+  globe:    '<circle cx="12" cy="12" r="9"/><path d="M3 12h18"/><path d="M12 3c2.5 2.4 3.8 5.5 3.8 9S14.5 18.6 12 21c-2.5-2.4-3.8-5.5-3.8-9S9.5 5.4 12 3Z"/>',
+  // A framed block of lines with ONE line short and lit, which is what the
+  // lens actually shows. 'doc' was the obvious alternative and is already
+  // spoken for twice - the Prompts tab and the notes card.
+  prompter: '<rect x="3" y="5" width="18" height="14" rx="2"/><path d="M7 10h10M7 14h6"/>',
+
   // Added for the tuning panel's section headers. Each one has to read at
   // 18px inside a card badge, so they are deliberately 2-3 strokes and no
   // more - detail at this size turns into a smudge.
@@ -446,6 +471,14 @@ function recall(key: string): boolean | null {
 export const PANEL_ORDER = {
   /** Pair picker + live lines (translate.ts), on the Translate tab. */
   translate: 5,
+  /**
+   * Teleprompter scripts (scripts.ts), alone on the Scripts tab.
+   *
+   * Low, so that anything mounted alongside it later - a prompter speed
+   * slider, say - stacks underneath rather than above the library it
+   * configures.
+   */
+  scripts: 7,
   /** Recording + Saved conversations (sessions.ts). */
   sessions: 10,
   /** Review (review.ts). */

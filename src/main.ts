@@ -12,6 +12,7 @@ import {
   type TranslateState,
   type TranslationLine,
   type NoteDue,
+  type TelepromptState,
 } from './asr/stt'
 import { mountUi, setStatus, setTranscript } from './ui'
 import {
@@ -31,6 +32,7 @@ import {
   showTranscriptPage,
   showHomePage,
   showAlertPage,
+  showMessagePage,
   homeContainer,
 } from './pages'
 import { mountSettings } from './settings'
@@ -57,10 +59,19 @@ import {
   lastPair,
 } from './translate'
 import { showTranslatePage, readMs, type LensTranslation } from './translatepage'
+import {
+  showTelepromptPage,
+  telepromptLines,
+  clampCursor,
+  wordIndexOfLine,
+  lineOfWordIndex,
+  setTelepromptLayout,
+} from './teleprompt'
 import { mountTabs } from './tabs'
 import { mountReview } from './review'
 import { mountPrompts } from './prompts'
 import { mountNotes } from './notes'
+import { mountScripts, applyTelepromptPreview } from './scripts'
 import { restUrl } from './api'
 import {
   statusContainers,
@@ -100,11 +111,40 @@ import {
 // Review. The two are different modes of the device - the gateway refuses to
 // caption and translate at once - so putting them in one scrolling column
 // would suggest they compose.
-const tabs = mountTabs(['Live', 'Conversations', 'Notes', 'Translate'])
+const tabs = mountTabs([
+  'Live',
+  'Conversations',
+  'Notes',
+  'Translate',
+  'Teleprompt',
+])
 
-// The full tuning panel, minus anything that belongs beside its own feature.
-// translate_hold_s is mounted on the Translate tab instead, further down.
-void mountSettings(tabs.Live, { omit: ['translate_hold_s'] })
+// The tuning panel, minus every group that belongs beside its own feature.
+//
+// WHAT IS LEFT ON LIVE is the capture chain - what counts as speech, where an
+// utterance starts and ends, speaker separation, the roster and timers. All
+// of it shapes the microphone, which is what this tab is about.
+//
+// Everything else is mounted next to the thing it configures, further down:
+// suggestions and review audio on Conversations, note alerts on Notes,
+// translation hold on Translate, prompter layout on Teleprompt. A slider
+// is easiest to judge while looking at what it changes.
+void mountSettings(tabs.Live, {
+  omit: [
+    'suggest_every_utts',
+    'suggest_cooldown_s',
+    'suggest_context_utts',
+    'suggest_timeout_s',
+    'suggest_hold_s',
+    'suggest_memory',
+    'suggest_dup_ratio',
+    'clip_retention_h',
+    'note_alert_s',
+    'translate_hold_s',
+    'teleprompt_row_h',
+    'teleprompt_chars',
+  ],
+})
 mountUi()
 mountReview(tabs.Conversations)
 
@@ -309,8 +349,32 @@ let currentText = INITIAL_CONTENT
 // bypasses all four while translating anyway, so this is belt and braces —
 // but a frame in flight when the mode changed would otherwise land on a page
 // whose transcript container does not exist.
-type PageMode = 'home' | 'transcript' | 'list' | 'alert' | 'translate'
+type PageMode =
+  | 'home'
+  | 'transcript'
+  | 'list'
+  | 'alert'
+  | 'translate'
+  | 'teleprompt'
 let pageMode: PageMode = 'home'
+
+// --- teleprompter -------------------------------------------------------
+//
+// PHASE 1: the script is the hardcoded DEMO_SCRIPT and there is no store
+// behind it yet. What this proves on the lens is the rendering and the
+// gestures - five rows, three brightness levels, swipe to move - which is
+// everything the AI-following mode will later drive.
+//
+// `telepromptScript` is the WRAPPED array, computed once when the page is
+// opened rather than on every render. wrapLines is pure and the script does
+// not change while it is being read, so re-wrapping per swipe would be work
+// for nothing - and a cursor indexing an array that could be re-wrapped
+// differently is a position that quietly means something else afterwards.
+let telepromptScript: string[] = []
+
+// LINE index into telepromptScript, not a row on the lens. The row is
+// derived from it by telepromptRows().
+let telepromptCursor = 0
 
 // --- translate mode, mirrored from the gateway --------------------------
 //
@@ -856,6 +920,51 @@ try {
           alertS: resolveAlertMs(note.alertS) / 1000,
         })
       },
+      onTeleprompt: (s: TelepromptState) => {
+        // ONLY MOVES THE PROMPTER WHEN THE PROMPTER IS ON THE LENS. This
+        // fires on reconnects and on a stop as well as on a match, and a
+        // frame arriving while the wearer is reading captions must not
+        // rebuild the page out from under them.
+        if (pageMode !== 'teleprompt') return
+        if (!s.active || telepromptScript.length === 0) return
+
+        const line = lineOfWordIndex(telepromptScript, s.word)
+        if (line === telepromptCursor) {
+          // The match advanced within the SAME line. Common - a line is
+          // about nine words and an utterance is often shorter - and
+          // redrawing an identical page would spend a BLE round trip to
+          // change nothing.
+          return
+        }
+
+        // NEVER FOLLOW BACKWARDS. Whisper revises: a partial can land a line
+        // ahead and its final settle a line behind, and honouring that shows
+        // as a visible flicker on the lens. follow.py already refuses small
+        // backward matches; this refuses the rest, because the reader is the
+        // only thing that should ever move a prompter back up. They can
+        // swipe, which goes through moveTeleprompt() and is unaffected.
+        if (line < telepromptCursor) {
+          console.log(
+            `[teleprompt] ignoring backward follow ${telepromptCursor + 1} -> ${line + 1}`,
+          )
+          return
+        }
+
+        console.log(
+          `[teleprompt] follow word ${s.word}/${s.words} -> line ${line + 1}`,
+        )
+        telepromptCursor = line
+        // ONE REBUILD PER LINE, and this is a hard constraint rather than a
+        // preference. A three-frame slide was tried here and stopped the
+        // prompter following speech at all: at 116-179ms per rebuild it put
+        // roughly half a second of BLE traffic behind every line, and
+        // utterances arrive faster than that.
+        //
+        // Not awaited: this hook is on the socket's message path and holding
+        // every frame behind a rebuild would back up captions, timers and
+        // everything else on the socket.
+        void showTelepromptPage(lensBridge, telepromptScript, telepromptCursor)
+      },
       onTranslate: (s: TranslateState) => {
         console.log(`[app] translate ${s.active ? `${s.a} -> ${s.b}` : 'off'}`)
         setTranslateState(s)
@@ -1018,10 +1127,54 @@ void mountSettings(tabs.Translate, {
 // gateway over REST, so a failed socket leaves prompt editing working.
 void mountPrompts(tabs.Conversations)
 
+// Suggestions and review audio, on the tab whose recordings they act on.
+// Both groups in ONE panel: two mounts would be two cards with two "Tuning"
+// headers, and bucket() already renders a group per card.
+//
+// header:false because "Reset all" from here would reset every tunable in
+// the app, from a card that appears to be about suggestions.
+void mountSettings(tabs.Conversations, {
+  only: [
+    'suggest_every_utts',
+    'suggest_cooldown_s',
+    'suggest_context_utts',
+    'suggest_timeout_s',
+    'suggest_hold_s',
+    'suggest_memory',
+    'suggest_dup_ratio',
+    'clip_retention_h',
+  ],
+  header: false,
+})
+
 // Notes, on their OWN tab. REST only, so the panel works with the glasses
 // disconnected and with the socket down - a failed socket leaves note
 // editing working, exactly as it does for the prompt library.
 void mountNotes(tabs.Notes)
+
+// The note alert slider, beside the notes it fires for.
+void mountSettings(tabs.Notes, {
+  only: ['note_alert_s'],
+  header: false,
+})
+
+// Teleprompter scripts, on their OWN tab for the same reason notes are:
+// REST only, so the panel works with the glasses disconnected and with the
+// socket down. This is where the script the lens opens is chosen.
+void mountScripts(tabs.Teleprompt)
+
+// The two prompter layout sliders, on the tab where the scripts they lay out
+// live. header:false because "Reset all" from here would reset every tunable
+// in the app from a card that appears to be about two sliders.
+void mountSettings(tabs.Teleprompt, {
+  only: ['teleprompt_row_h', 'teleprompt_chars'],
+  header: false,
+  // Straight into the preview, so a slider redraws it without the Scripts
+  // panel polling /settings. Fires on load and after every successful save,
+  // never on a failed one - so the preview never shows a value the gateway
+  // rejected.
+  onChange: applyTelepromptPreview,
+})
 
 if (stt) {
   await bridge.audioControl(true)
@@ -1047,8 +1200,10 @@ if (stt) {
  */
 async function renderAssistant(s: AssistantState) {
   const boxes = assistantBox(s)
-  const body = boxes[0]?.content ?? ''
-  console.log(`[assist] ${s.phase} content=${JSON.stringify(body)}`)
+  console.log(
+    `[assist] ${s.phase} boxes=${boxes.length} ` +
+      boxes.map(b => JSON.stringify(b.content ?? '')).join(' | '),
+  )
 
   // The strip goes on this page too. Note this ALSO changes the overlay from
   // a one-container page to a three-container one — which is the exact
@@ -1069,18 +1224,26 @@ async function renderAssistant(s: AssistantState) {
   // aimed at a container that is not on the page does nothing at all and
   // reports nothing, so reading from the built object keeps the two in step
   // by construction.
-  let upgraded = false
+  // EVERY box, not just the first: the question and the answer are separate
+  // containers now, because brightness is a property of a container and the
+  // two need different ones. Upgrading only boxes[0] would leave the answer
+  // showing whatever the rebuild put there and never correct it.
+  const upgraded: boolean[] = []
   if (ok) {
-    upgraded = await bridge.textContainerUpgrade(
-      new TextContainerUpgrade({
-        containerID: boxes[0]?.containerID ?? OVERLAY_Q_ID,
-        containerName: boxes[0]?.containerName ?? OVERLAY_NAME,
-        content: body,
-      }),
-    )
+    for (const box of boxes) {
+      upgraded.push(
+        await bridge.textContainerUpgrade(
+          new TextContainerUpgrade({
+            containerID: box.containerID ?? OVERLAY_Q_ID,
+            containerName: box.containerName ?? OVERLAY_NAME,
+            content: box.content ?? '',
+          }),
+        ),
+      )
+    }
   }
 
-  console.log(`[assist] ${s.phase} rebuild=${ok} upgrade=${upgraded}`)
+  console.log(`[assist] ${s.phase} rebuild=${ok} upgrade=${upgraded.join(',')}`)
 
   if (!ok) {
     // A z-order violation fails HERE, client-side, without ever reaching the
@@ -1181,6 +1344,141 @@ async function showCaptions() {
  * the caption containers are not on this page, so whatever they hold no longer
  * describes the lens.
  */
+async function showTeleprompt(reset = false) {
+  console.log(`[page] teleprompt (from ${pageMode})`)
+
+  if (reset || telepromptScript.length === 0) {
+    // The gateway is authoritative for which script this is. /scripts/active
+    // returns the ONE script rather than the library, because the lens has no
+    // picker yet and pulling the whole library to use one of it would be
+    // work for nothing.
+    let script: { title?: string; text?: string } | null
+    try {
+      const r = await fetch(restUrl('/scripts/active'))
+      if (!r.ok) throw new Error(`${r.status}`)
+      script = ((await r.json()) as { script: typeof script }).script
+    } catch (e) {
+      setStatus('error', `script fetch failed: ${(e as Error).message}`)
+      console.error('Failed to fetch active script:', e)
+      // A full-width message rather than a blank prompter. An empty
+      // teleprompter and a broken one look identical on the lens, and the
+      // wearer cannot see the phone's status line from inside the glasses.
+      await showMessagePage(lensBridge, 'Could not load script')
+      pageMode = 'transcript'
+      lastNames = ''
+      lastText = ''
+      return
+    }
+
+    // AN EMPTY LIBRARY IS NOT AN ERROR. /scripts/active answers 200 with a
+    // null script when nothing has been saved yet, which is an ordinary
+    // state on a fresh install and deserves an instruction rather than a
+    // failure.
+    if (!script || !script.text) {
+      console.log('[teleprompt] no active script')
+      await showMessagePage(lensBridge, 'No script saved yet')
+      pageMode = 'transcript'
+      lastNames = ''
+      lastText = ''
+      return
+    }
+
+    // LAYOUT BEFORE WRAPPING. teleprompt_chars decides where lines break, so
+    // fetching it after telepromptLines() would wrap at the old width and
+    // leave the cursor indexing an array built to a different geometry.
+    //
+    // Fetched on every open rather than once at startup, so moving the
+    // sliders and re-opening the prompter shows the new layout - which is
+    // the only way to judge these two numbers.
+    //
+    // A failure here is NOT fatal: the defaults in teleprompt.ts are sane
+    // and a prompter at the wrong line spacing beats no prompter at all.
+    try {
+      const r = await fetch(restUrl('/settings'))
+      if (r.ok) {
+        const d = (await r.json()) as { values: Record<string, number> }
+        setTelepromptLayout({
+          rowH: d.values?.teleprompt_row_h,
+          chars: d.values?.teleprompt_chars,
+        })
+      }
+    } catch (e) {
+      console.warn('[teleprompt] layout fetch failed, using defaults:', e)
+    }
+
+    console.log(`[teleprompt] loaded ${script.title ?? 'untitled'} (${script.text.length} chars)`)
+    telepromptScript = telepromptLines(script.text)
+    telepromptCursor = 0
+
+    // Tell the gateway to start following. It reads the script from its own
+    // store rather than being sent the text - see stt.ts - so this cannot
+    // disagree with the copy just fetched: both came from /scripts.
+    //
+    // Fire and forget, and NOT awaited before the page is built: a gateway
+    // that is down should still leave a readable prompter that swipes.
+    stt?.startTeleprompt()
+  }
+
+  const ok = await showTelepromptPage(
+    lensBridge,
+    telepromptScript,
+    telepromptCursor,
+  )
+  if (!ok) {
+    // rebuildPageContainer returning false is almost always a CLIENT-SIDE
+    // validation failure - a duplicate or missing zOrderIndex, or a menu
+    // label over 32 UTF-8 bytes - which never reaches the glasses. It is
+    // not a BLE problem and retrying will not help.
+    setStatus('error', 'rebuildPageContainer failed (teleprompt)')
+    console.error('Failed to build teleprompt page')
+    return
+  }
+
+  pageMode = 'teleprompt'
+  // The caption containers are not on this page, so the caches that say what
+  // was last written to them have to be cleared or the next return to
+  // captions will skip a write it thinks it already made.
+  lastNames = ''
+  lastText = ''
+  lastSuggestion = ''
+  bandOnPage = false
+  bandBorderOnPage = false
+  refreshStatus()
+}
+
+/**
+ * Move the cursor and redraw.
+ *
+ * A FULL PAGE REBUILD per line, deliberately, rather than five
+ * textContainerUpgrade calls. Brightness moves with the cursor - the line
+ * that was the focus becomes a spoken line - and textContainerUpgrade can
+ * carry `textColor`, so five upgrades would work in principle. But five
+ * bridge calls on a BLE queue slow enough to need a 120ms debounce elsewhere
+ * in this file is not obviously cheaper than one rebuild, and five calls can
+ * land SPLIT ACROSS A FRAME, showing two focus lines or none.
+ *
+ * If the rebuild turns out to be too slow to swipe against, THAT is when to
+ * try the upgrade path - with a measurement rather than a guess.
+ */
+async function moveTeleprompt(delta: number) {
+  const next = clampCursor(telepromptCursor + delta, telepromptScript)
+  if (next === telepromptCursor) {
+    // Already at an end. Redrawing an identical page would spend a BLE
+    // round trip to change nothing.
+    console.log(`[teleprompt] at ${delta > 0 ? 'end' : 'start'} of script`)
+    return
+  }
+  console.log(`[teleprompt] line ${next + 1}/${telepromptScript.length}`)
+
+  // THE THUMB WINS. Without this the aligner keeps searching around its own
+  // old cursor, and the next matched utterance drags the prompter back to
+  // where the wearer just moved it away from.
+  stt?.seekTeleprompt(wordIndexOfLine(telepromptScript, next))
+
+  telepromptCursor = next
+  await showTelepromptPage(lensBridge, telepromptScript, telepromptCursor)
+}
+
 async function showHome() {
   console.log(`[page] home (from ${pageMode})`)
   const ok = await showHomePage(lensBridge)
@@ -1698,6 +1996,13 @@ async function runMenuAction(action: MenuAction) {
         stt?.startTranslate(p.a, p.b)
       }
       break
+    case 'teleprompt':
+      // `true` reloads the script and sends the cursor back to the top.
+      // Opening the prompter from the menu means starting a read, not
+      // resuming one - and with no store behind it there is nothing yet that
+      // could make resuming meaningful.
+      await showTeleprompt(true)
+      break
     case 'session':
       toggleSession()
       // Leave the menu so the user sees captions and the recording flag
@@ -1710,17 +2015,13 @@ async function runMenuAction(action: MenuAction) {
       // holding still says what it said when this page was built.
       await refreshMenu()
       break
-    case 'exit':
-      // exitMode 1 shows the OS confirmation layer; SYSTEM_EXIT_EVENT
-      // arrives on confirm. Mode 0 (immediate) is explicitly not acceptable.
-      //
-      // NOTE this item is now REDUNDANT twice over: the OS puts its own
-      // "Close <app name>" row at the bottom of this same menu, and the root
-      // page double tap below does the same thing. It is kept because it was
-      // one of the old menu's options; delete it from MENU_ACTIONS in menu.ts
-      // and nothing else has to change.
-      await bridge.shutDownPageContainer(1)
-      break
+    // 'exit' USED TO BE HERE and has been removed from MENU_ACTIONS. The OS
+    // already puts its own "Close" row at the bottom of this same menu, so
+    // ours was a second item doing the identical thing - and the root page
+    // double tap below is a third route to it.
+    //
+    // shutDownPageContainer(1) is still called there, on the double tap, so
+    // the exitMode-1 confirmation requirement is unaffected.
     default:
       await showCaptions()
   }
@@ -1879,6 +2180,17 @@ async function goBack() {
     console.log('[app] double-tap in translate -> ending translate mode')
     stt?.stopTranslate()
     return
+  }
+  if (pageMode === 'teleprompt') {
+    // Leaving the prompter ends the follow. A gateway left following a
+    // script nobody is reading would keep matching ordinary conversation
+    // against it and logging moves for a page that is not on the lens.
+    //
+    // NOTE this is the only exit that stops it. Reaching for the menu and
+    // picking Captions or Translate leaves the follow running until the next
+    // teleprompt_start replaces it - harmless, since nothing renders it, but
+    // worth knowing when reading the gateway log.
+    stt?.stopTeleprompt()
   }
   if (pageMode === 'home') {
     // ROOT PAGE. Double tap here MUST call shutDownPageContainer(1) — the
@@ -2070,6 +2382,43 @@ const unsubscribe = bridge.onEvenHubEvent(event => {
     return
   }
 
+  // THE TELEPROMPTER OWNS SWIPES ON ITS OWN PAGE.
+  //
+  // Placed here - after the double-tap branch, before the list-scroll branch
+  // - so that double tap still leaves the page and so that a list page is
+  // unaffected.
+  //
+  // The mapping was measured on the glasses: swipe FORWARD on the
+  // right temple reported textEvent 2 (SCROLL_BOTTOM_EVENT) and swipe
+  // BACKWARD reported textEvent 1 (SCROLL_TOP_EVENT). If forward turns out
+  // to move the script backwards on the lens, swap these two and nothing
+  // else needs to change.
+  //
+  // sysType and listType are checked as well as textType because the page is
+  // built from text containers but nothing documents which envelope the
+  // firmware uses on a page with five of them rather than one.
+  if (pageMode === 'teleprompt') {
+    if (
+      textType === OsEventTypeList.SCROLL_BOTTOM_EVENT ||
+      sysType === OsEventTypeList.SCROLL_BOTTOM_EVENT ||
+      listType === OsEventTypeList.SCROLL_BOTTOM_EVENT
+    ) {
+      void moveTeleprompt(1)
+      return
+    }
+    if (
+      textType === OsEventTypeList.SCROLL_TOP_EVENT ||
+      sysType === OsEventTypeList.SCROLL_TOP_EVENT ||
+      listType === OsEventTypeList.SCROLL_TOP_EVENT
+    ) {
+      void moveTeleprompt(-1)
+      return
+    }
+    // A single tap does NOTHING here yet, deliberately. It is the obvious
+    // home for play/pause once Auto mode exists; wiring it to something else
+    // now would only have to be unwired then.
+  }
+
   // Scrolling is handled by the OS - the list moves itself and reports
   // afterwards. Logged only, so the selected index is visible while
   // tuning itemCount. Deliberately does NOT rebuild the page: doing so
@@ -2130,6 +2479,16 @@ const unsubscribe = bridge.onEvenHubEvent(event => {
       // opposite is reading. Double tap ends the mode, which is the only
       // action this page has.
       console.log('[translate] tap ignored — double-tap to end')
+    } else if (pageMode === 'teleprompt') {
+      // A single tap does NOTHING here, deliberately - the measurement that
+      // borrowed this gesture has served its purpose and is gone.
+      //
+      // The branch still has to exist: the final `else` below is caption
+      // mode and calls toggleMic(), so without it a tap while reading a
+      // script would silently pause capture.
+      //
+      // This is the obvious home for play/pause once Auto mode exists.
+      console.log('[teleprompt] tap ignored - swipe to move, double-tap to leave')
     } else if (pageMode === 'home') {
       // The home page shows nothing, so there is nothing on it to act on.
       //

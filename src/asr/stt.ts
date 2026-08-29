@@ -132,6 +132,31 @@ export interface SttHandle {
   stopTranslate(): void
   /** Ask the gateway to restate translate mode (used after a reconnect). */
   translateStatus(): void
+  /**
+   * Start following a script for AI teleprompter mode.
+   *
+   * The gateway reads the script from its own store - `id` selects one,
+   * omitting it uses the active one - so this does NOT ship the text. The
+   * store is the one authority on which script is active, and sending the
+   * text would create a second copy that could disagree with it.
+   *
+   * Fire and forget. The gateway answers with a 'teleprompt' frame either
+   * way, including when it has no script to follow.
+   */
+  startTeleprompt(id?: string): void
+  /** Stop following. Manual scrolling on the lens is unaffected. */
+  stopTeleprompt(): void
+  /**
+   * Tell the gateway the wearer moved the prompter by hand.
+   *
+   * `word` is a WORD index into the script, not a line: the gateway has
+   * never seen how the text wraps and cannot be given a row. Without this,
+   * a manual correction would be undone by the next matched utterance,
+   * because the aligner would still be searching around its own old cursor.
+   */
+  seekTeleprompt(word: number): void
+  /** Ask the gateway to restate following state (used after a reconnect). */
+  telepromptStatus(): void
 }
 
 export interface SttResult {
@@ -286,6 +311,37 @@ export interface SttHooks {
    * those out is the consumer's decision, not this module's.
    */
   onTranslation?: (line: TranslationLine) => void
+  /**
+   * The teleprompter's position in the script moved, or following turned on
+   * or off.
+   *
+   * Fires on every teleprompt_start, teleprompt_stop, teleprompt_seek and
+   * teleprompt_status, and on every utterance the gateway managed to match.
+   * It does NOT fire for an utterance that did not match - the aligner stays
+   * put and says nothing, which is the common case for a cough or a question
+   * from the room.
+   *
+   * `word` is a WORD index into the script, never a line: the gateway has
+   * never seen how the text wraps. Turning it into a row is the consumer's
+   * job, via lineOfWordIndex() in teleprompt.ts.
+   *
+   * Whole state on every frame, like onTranslate, so a consumer that missed
+   * one recovers on the next.
+   */
+  onTeleprompt?: (s: TelepromptState) => void
+}
+
+export interface TelepromptState {
+  /** Whether the gateway is following a script at all. */
+  active: boolean
+  /** Title of the script being followed, or null. Diagnostic. */
+  title: string | null
+  /** Words of the script considered delivered. Index of the NEXT word. */
+  word: number
+  /** Total words in the script, 0 when not following. */
+  words: number
+  /** Set when a start was refused, e.g. no script saved. */
+  error?: string
 }
 
 /**
@@ -812,6 +868,19 @@ export function startSttStream(
           }
           break
 
+        case 'teleprompt':
+          if (msg.error) {
+            console.warn(`[stt] teleprompt rejected: ${msg.error}`)
+          }
+          hooks.onTeleprompt?.({
+            active: !!msg.active,
+            title: msg.title ?? null,
+            word: typeof msg.word === 'number' ? msg.word : 0,
+            words: typeof msg.words === 'number' ? msg.words : 0,
+            error: typeof msg.error === 'string' ? msg.error : undefined,
+          })
+          break
+
         case 'translate':
           // Mode state. The ONLY writer of `translating`, which is why
           // startTranslate() below does not touch it.
@@ -965,6 +1034,22 @@ export function startSttStream(
 
     sessionStatus() {
       sendCmd('session_status')
+    },
+
+    startTeleprompt(id?: string) {
+      sendCmd('teleprompt_start', id ? { id } : {})
+    },
+
+    stopTeleprompt() {
+      sendCmd('teleprompt_stop')
+    },
+
+    seekTeleprompt(word: number) {
+      sendCmd('teleprompt_seek', { word })
+    },
+
+    telepromptStatus() {
+      sendCmd('teleprompt_status')
     },
 
     startTranslate(a: string, b: string) {

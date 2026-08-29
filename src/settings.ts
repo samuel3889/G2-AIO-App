@@ -80,6 +80,18 @@ export interface SettingsOptions {
    * the app, from a card that appears to be about one slider.
    */
   header?: boolean
+  /**
+   * Called with the full values map after a successful load and after every
+   * successful save.
+   *
+   * Exists so a panel elsewhere on the same tab can react to a slider - the
+   * teleprompter preview in scripts.ts redraws from it. NOT called on a
+   * failed save, so a consumer never renders a value the gateway rejected.
+   *
+   * Carries the WHOLE values map, not just what changed: a consumer reading
+   * two keys should not have to remember the one that did not move.
+   */
+  onChange?: (values: Record<string, number>) => void
 }
 
 interface Tunable {
@@ -182,6 +194,13 @@ const GROUPS: Group[] = [
     sub: 'How long a translated line stays up',
     icon: 'clock',
     keys: ['translate_hold_s'],
+  },
+  {
+    id: 'teleprompt',
+    title: 'Prompter layout',
+    sub: 'Line spacing and width on the lens',
+    icon: 'doc',
+    keys: ['teleprompt_row_h', 'teleprompt_chars'],
   },
 ]
 
@@ -304,6 +323,7 @@ export async function mountSettings(
     // filtered - it is only ever read by key.
     schema = filterSchema(d.schema)
     values = d.values
+    opts.onChange?.(values)
   }
 
   // Debounced so dragging fires one write, not fifty.
@@ -328,6 +348,7 @@ export async function mountSettings(
         values = (await r.json()).values
         setBadge('Saved', 'ok')
         say('')
+        opts.onChange?.(values)
       } catch (e) {
         setBadge('Failed', 'bad')
         say(`save failed: ${(e as Error).message}`, true)

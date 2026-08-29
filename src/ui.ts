@@ -50,7 +50,6 @@ const CSS = `
 /** How close to the bottom still counts as "following the live text". */
 const STICK_PX = 40
 
-let statusEl: HTMLSpanElement | null = null
 let finalEl: HTMLSpanElement | null = null
 let interimEl: HTMLSpanElement | null = null
 let boxEl: HTMLDivElement | null = null
@@ -71,7 +70,6 @@ export function mountUi() {
           <span class="ttl">Live captions</span>
           <span class="sub">Mirrored from the lens</span>
         </span>
-        <span class="aside"><span id="status" class="chip mute">Connecting</span></span>
       </div>
       <div class="card-b">
         <div id="tx" class="tx" aria-live="polite">
@@ -86,28 +84,32 @@ export function mountUi() {
     </section>
   `
 
-  statusEl = app.querySelector<HTMLSpanElement>('#status')
   finalEl = app.querySelector<HTMLSpanElement>('#final')
   interimEl = app.querySelector<HTMLSpanElement>('#interim')
   boxEl = app.querySelector<HTMLDivElement>('#tx')
 }
 
-/** chip class + top-bar mirror for each state. */
-const LOOK: Record<Status, { chip: string; shell: 'ok' | 'bad' | 'idle' }> = {
-  connecting: { chip: 'chip mute', shell: 'idle' },
-  listening: { chip: 'chip ok pulse', shell: 'ok' },
-  paused: { chip: 'chip warn', shell: 'idle' },
-  error: { chip: 'chip bad', shell: 'bad' },
+/**
+ * Top-bar shell state for each status.
+ *
+ * THERE USED TO BE A CHIP HERE TOO, in the Live captions card header, showing
+ * the same string. It was removed: the top bar already carries it, on every
+ * tab, and the card header is only wide enough for a few words - so the chip
+ * clipped its own text AND squashed "Live captions" into two lines to make
+ * room for a duplicate that said less.
+ *
+ * The status text can be long ('HOME * TAP FOR CAPTIONS * HOLD FOR MENU'), so
+ * the one place it is shown should be the full-width one.
+ */
+const LOOK: Record<Status, 'ok' | 'bad' | 'idle'> = {
+  connecting: 'idle',
+  listening: 'ok',
+  paused: 'idle',
+  error: 'bad',
 }
 
 export function setStatus(kind: Status, text: string) {
-  const look = LOOK[kind]
-  if (statusEl) {
-    statusEl.className = look.chip
-    statusEl.textContent = text
-  }
-  // Mirrored so the state is legible from any tab.
-  setShellStatus(look.shell, text)
+  setShellStatus(LOOK[kind], text)
 }
 
 export function setTranscript(finalText: string, interimText: string) {

@@ -59,9 +59,9 @@ import {
 export type MenuAction =
   | 'captions'
   | 'translate'
+  | 'teleprompt'
   | 'session'
   | 'mic'
-  | 'exit'
 
 /**
  * Payload order. There is NO ordering field on MenuItemProperty - the OS
@@ -71,9 +71,9 @@ export type MenuAction =
 export const MENU_ACTIONS: MenuAction[] = [
   'captions',
   'translate',
+  'teleprompt',
   'session',
   'mic',
-  'exit',
 ]
 
 /**
@@ -90,7 +90,13 @@ export const MENU_ITEM_IDS: Record<MenuAction, number> = {
   translate: 2,
   session: 3,
   mic: 4,
-  exit: 5,
+  // 5 was 'exit'. NOT REUSED: these are a wire contract, and a build that
+  // still had the old menu on the lens would map a tap on 5 to whatever
+  // took its place.
+  // 6 because these are a WIRE CONTRACT, not positions. teleprompt sits
+  // third in MENU_ACTIONS above and still has the next unused ID, which is
+  // the whole point of keeping the two tables separate.
+  teleprompt: 6,
 }
 
 /** Reverse lookup, built once from the table above. */
@@ -188,12 +194,15 @@ function fitLabel(label: string): string {
 export function menuLabels(state: MenuState): string[] {
   const pair =
     `${state.translatePair.a.toUpperCase()} > ${state.translatePair.b.toUpperCase()}`
+  // ORDER MUST MATCH MENU_ACTIONS. menuContainer() zips these two arrays by
+  // index, so an entry added to one and not the other silently labels the
+  // wrong action.
   return [
     'Captions',
     state.translateActive ? 'Stop translation' : `Translate ${pair}`,
+    'Teleprompt',
     state.sessionActive ? 'Stop & save' : 'Start conversation',
     state.micOn ? 'Pause mic' : 'Resume mic',
-    'Exit',
   ].map(fitLabel)
 }
 
