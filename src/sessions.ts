@@ -45,6 +45,7 @@
 import type { SessionState } from './asr/stt'
 import { restBase, restUrl } from './api'
 import { installTheme, makeCard, icon, PANEL_ORDER } from './theme'
+import { mountSetupSummary } from './setup'
 
 interface StoredSession {
   id: string
@@ -84,11 +85,6 @@ const CSS = `
 }
 .g2c .tags { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 8px; }
 .g2c .btns { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 10px; }
-
-/* The inline rename editor. Sits between the tags and the button row, so
-   the buttons that opened it stay where they were rather than jumping. */
-.g2c .renbox { margin-top: 10px; }
-.g2c .renbox .btns { margin-top: 8px; }
 `
 
 let controls: Controls | null = null
@@ -105,6 +101,8 @@ function when(ts: number | null): string {
   // The gateway stores seconds (time.time()); JS wants milliseconds.
   return ts ? new Date(ts * 1000).toLocaleString() : ''
 }
+
+let setupView: ReturnType<typeof mountSetupSummary> | null = null
 
 export function mountSessions(c: Controls, host?: HTMLElement) {
   controls = c
@@ -140,6 +138,8 @@ export function mountSessions(c: Controls, host?: HTMLElement) {
     <div class="liveline"><span class="dot"></span><span class="txt">Not recording</span></div>
     <div class="lbl">Title <span style="text-transform:none;letter-spacing:0;color:var(--text-3)">(optional)</span></div>
     <input class="inp title" type="text" maxlength="80" placeholder="e.g. Standup with Dana">
+    <div class="lbl" style="margin-top:12px">This recording will use</div>
+    <div class="setup"></div>
     <div class="btnrow" style="margin-top:12px">
       <button class="btn primary wide rec-toggle" type="button">${icon('record')}<span>Start recording</span></button>
     </div>`
@@ -149,6 +149,12 @@ export function mountSessions(c: Controls, host?: HTMLElement) {
   liveTxt = rec.body.querySelector<HTMLElement>('.liveline .txt')
   recBtn = rec.body.querySelector<HTMLButtonElement>('.rec-toggle')
   titleEl = rec.body.querySelector<HTMLInputElement>('.title')
+
+  // Resolved server-side state, painted next to the button that commits
+  // to it. Mounted here rather than in main.ts because it belongs to this
+  // card and has no meaning outside it.
+  const setupEl = rec.body.querySelector<HTMLElement>('.setup')
+  if (setupEl) setupView = mountSetupSummary(setupEl)
 
   recBtn?.addEventListener('click', () => {
     if (live.active) {
@@ -198,6 +204,11 @@ export function mountSessions(c: Controls, host?: HTMLElement) {
 export function setLiveSession(s: SessionState) {
   const wasActive = live.active
   live = s
+
+  // The prep note is captured by the gateway at session_start, so the
+  // setup block switches from "captured when recording starts" to
+  // "locked for this recording" at exactly this moment.
+  setupView?.setRecording(s.active)
 
   if (liveEl && liveTxt) {
     liveTxt.textContent = s.active
@@ -281,7 +292,6 @@ function render(items: StoredSession[]) {
         <button class="btn sm sum" type="button">${icon('spark')}<span>${
           s.has_summary ? 'Re-summarise' : 'Summarise'
         }</span></button>
-        <button class="btn sm ren" type="button">${icon('edit')}<span>Rename</span></button>
         <button class="btn sm danger del" type="button">${icon('trash')}<span>Delete</span></button>
       </div>`
 
@@ -332,70 +342,6 @@ function render(items: StoredSession[]) {
         sumBtn.innerHTML = was
         body.hidden = false
         body.textContent = `summary failed: ${(e as Error).message}`
-      }
-    }
-
-    // RENAME. The gateway has always supported this - PATCH /sessions/{sid}
-    // in routes_sessions.py, where `title` is the only writable field
-    // because the transcript is a record. Nothing was missing but the
-    // button.
-    //
-    // The editor is built INSIDE the row rather than as a prompt() dialog:
-    // prompt() is blocked in some WebViews and styled by the OS in the rest,
-    // and this panel already renders its own inputs.
-    const renBtn = row.querySelector('.ren') as HTMLButtonElement
-    renBtn.onclick = () => {
-      if (row.querySelector('.renbox')) return
-
-      const box = document.createElement('div')
-      box.className = 'renbox'
-      box.innerHTML = `
-        <input class="inp rt" type="text" maxlength="120"
-               placeholder="e.g. Standup with Dana">
-        <div class="btns">
-          <button class="btn sm primary ok" type="button">${icon('check')}<span>Save</span></button>
-          <button class="btn sm ghost no" type="button">Cancel</button>
-        </div>`
-      row.insertBefore(box, row.querySelector('.btns'))
-
-      const input = box.querySelector('.rt') as HTMLInputElement
-      // The CURRENT title, not the fallback shown in the list. `s.title ||
-      // s.id` is what the row displays for an untitled session, and
-      // pre-filling the id would make "just tap Save" name it after its own
-      // filename.
-      input.value = s.title
-      input.focus()
-
-      const close = () => box.remove()
-      ;(box.querySelector('.no') as HTMLButtonElement).onclick = close
-
-      const save = async () => {
-        // 120 to match the server's own cap in patch_session; the input
-        // maxlength enforces it before the round trip, this is the guard for
-        // a pasted value.
-        const title = input.value.trim().slice(0, 120)
-        try {
-          const r = await fetch(restUrl(`/sessions/${s.id}`), {
-            method: 'PATCH',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ title }),
-          })
-          if (!r.ok) throw new Error(`${r.status}`)
-          close()
-          // Refreshed rather than patched in place: the index is sorted and
-          // rebuilt from the server, so a locally edited label could drift
-          // from what the next refresh shows.
-          await refreshSessions()
-        } catch (e) {
-          body.hidden = false
-          body.textContent = `rename failed: ${(e as Error).message}`
-        }
-      }
-
-      ;(box.querySelector('.ok') as HTMLButtonElement).onclick = save
-      input.onkeydown = ev => {
-        if (ev.key === 'Enter') void save()
-        if (ev.key === 'Escape') close()
       }
     }
 

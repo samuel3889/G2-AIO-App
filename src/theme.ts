@@ -491,8 +491,23 @@ export const PANEL_ORDER = {
    * shapes a future recording.
    */
   notes: 25,
+  /**
+   * Prep notes (prep.ts).
+   *
+   * Directly above the prompt library, because the two are read in that
+   * order: which lesson is attached changes between class periods, how the
+   * suggester phrases itself does not.
+   */
+  prep: 28,
   /** Suggestion prompts (prompts.ts). */
   prompts: 30,
+  /**
+   * Summary prompts (summaryprompts.ts).
+   *
+   * Directly below the suggest prompts: same kind of object, read second
+   * because it acts after a recording rather than during one.
+   */
+  summaryPrompts: 32,
   /**
    * Tuning sliders (settings.ts). LAST on whatever tab they appear on.
    *

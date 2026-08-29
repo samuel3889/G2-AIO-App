@@ -104,6 +104,14 @@ const CSS = `
 }
 .g2sc .tags { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 8px; }
 .g2sc .btns { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 10px; }
+.g2sc .pickhint { font-size: 11px; color: var(--text-3); margin-top: 8px; }
+.g2sc .pickhint:empty { display: none; }
+.g2sc .prev {
+  font-size: 12px; color: var(--text-2); margin: 0 0 10px; padding: 8px 10px;
+  border-radius: var(--r2); background: var(--sunken);
+  border: 1px solid var(--line-soft); overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
 `
 
 /**
@@ -152,8 +160,13 @@ export async function mountScripts(host?: HTMLElement) {
     <div class="body"></div>
     <div class="btns">
       <button class="btn sm new" type="button">${icon('plus')}<span>New script</span></button>
+      <button class="btn sm pick" type="button">${icon('plus')}<span>From file</span></button>
       <span class="state"></span>
-    </div>`
+    </div>
+    <div class="pickhint"></div>
+    <input class="file" type="file"
+           accept=".pdf,.docx,.md,.txt,.csv,text/plain,application/pdf"
+           style="display:none">`
   root.appendChild(card.root)
 
   // --- lens preview -------------------------------------------------------
@@ -178,6 +191,9 @@ export async function mountScripts(host?: HTMLElement) {
   const body = card.body.querySelector('.body') as HTMLElement
   const stateEl = card.body.querySelector('.state') as HTMLElement
   const newBtn = card.body.querySelector('.new') as HTMLButtonElement
+  const pickBtn = card.body.querySelector('.pick') as HTMLButtonElement
+  const fileEl = card.body.querySelector('.file') as HTMLInputElement
+  const hintEl = card.body.querySelector('.pickhint') as HTMLElement
 
   const say = (m: string, err = false) => {
     stateEl.textContent = m
@@ -488,6 +504,7 @@ export async function mountScripts(host?: HTMLElement) {
     paintActive()
     renderPreview()
     newBtn.disabled = editing !== ''
+    pickBtn.disabled = editing !== ''
     if (editing === 'new') return renderEditor(null)
     if (editing) {
       const s = store.scripts.find(q => q.id === editing)
@@ -495,6 +512,71 @@ export async function mountScripts(host?: HTMLElement) {
       editing = ''
     }
     renderList()
+  }
+
+  // --------------------------------------------------------- file upload
+
+  pickBtn.onclick = () => {
+    // Shown BEFORE the picker opens rather than after a failure. A WebView
+    // whose host app does not implement onShowFileChooser fires no event at
+    // all, so there is nothing to hang an error handler on.
+    hintEl.textContent =
+      'If no file chooser opens, this app cannot reach your files. '
+      + 'Send the script from a computer instead.'
+    fileEl.value = ''
+    fileEl.click()
+  }
+
+  fileEl.onchange = async () => {
+    const f = fileEl.files && fileEl.files[0]
+    if (!f) return
+    hintEl.textContent = ''
+
+    say(`uploading ${f.name} (${Math.round(f.size / 1024)} KB)\u2026`)
+
+    try {
+      // Raw bytes to /scripts/upload; the gateway extracts. Nothing is
+      // decoded here - a .docx read as text is zip binary.
+      const buf = await f.arrayBuffer()
+      const base = f.name.replace(/\.[^.]+$/, '')
+      const q = `filename=${encodeURIComponent(f.name)}`
+        + `&title=${encodeURIComponent(base)}`
+
+      const r = await fetch(restUrl(`/scripts/upload?${q}`), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/octet-stream' },
+        body: buf,
+      })
+      const d = await r.json()
+
+      if (!r.ok) {
+        // extract.py writes these for whoever chose the file - "probably a
+        // scan with no text layer", "save as .docx" - so the server's own
+        // words are shown rather than a status code.
+        say(d.error || `upload failed: ${r.status}`, true)
+        return
+      }
+
+      store = d as Store
+      editing = ''
+      render()
+      say(`added ${d.chars} characters`)
+
+      // A LONGER PREVIEW THAN THE PREP PANEL SHOWS, on purpose. A script is
+      // read aloud word for word, so what matters is not just that text came
+      // out but that it came out IN ORDER. A PDF with columns extracts into
+      // interleaved lines that look fine one line at a time. white-space is
+      // pre-wrap so the real line breaks are visible.
+      const prev = document.createElement('div')
+      prev.className = 'prev'
+      prev.textContent =
+        (d.truncated ? `Cut at ${d.chars} of ${d.extracted} characters.\n\n` : '')
+        + `Read this back. If the lines are out of order, the file did not `
+        + `convert cleanly:\n\n${d.preview}\u2026`
+      body.prepend(prev)
+    } catch (e) {
+      say(`upload failed: ${(e as Error).message}`, true)
+    }
   }
 
   newBtn.onclick = () => {

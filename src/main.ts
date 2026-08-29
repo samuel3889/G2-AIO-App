@@ -69,7 +69,9 @@ import {
 } from './teleprompt'
 import { mountTabs } from './tabs'
 import { mountReview } from './review'
+import { mountPrep } from './prep'
 import { mountPrompts } from './prompts'
+import { mountSummaryPrompts } from './summaryprompts'
 import { mountNotes } from './notes'
 import { mountScripts, applyTelepromptPreview } from './scripts'
 import { restUrl } from './api'
@@ -1126,6 +1128,16 @@ void mountSettings(tabs.Translate, {
 // job, not this call's position. Independent of `stt`: it only talks to the
 // gateway over REST, so a failed socket leaves prompt editing working.
 void mountPrompts(tabs.Conversations)
+
+// Prep notes, in the same tab and directly above the prompt library. Same
+// independence from `stt`: choosing next period's lesson has to work whether
+// or not the glasses are connected, because it happens between classes.
+void mountPrep(tabs.Conversations)
+
+// Summary prompts, below the suggest prompt library. Also REST-only, so it
+// works with no glasses attached - which is when you would be editing one,
+// after a class rather than during it.
+void mountSummaryPrompts(tabs.Conversations)
 
 // Suggestions and review audio, on the tab whose recordings they act on.
 // Both groups in ONE panel: two mounts would be two cards with two "Tuning"

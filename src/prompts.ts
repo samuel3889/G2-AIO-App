@@ -37,6 +37,7 @@
  */
 import { restBase, restUrl } from './api'
 import { installTheme, makeCard, icon, PANEL_ORDER } from './theme'
+import { SETUP_CHANGED, notifySetupChanged } from './setup'
 
 interface StoredPrompt {
   id: string
@@ -47,9 +48,13 @@ interface StoredPrompt {
 
 interface Store {
   active: string
+  /** '' means "same as active". Not an error state. */
+  active_prep: string
   prompts: StoredPrompt[]
-  /** What the gateway would actually send right now. Present on GET only. */
+  /** What the gateway sends for a recording with NO prep note. GET only. */
   effective?: { label: string; chars: number }
+  /** What it sends for a recording WITH one. GET only. */
+  effective_prep?: { label: string; chars: number }
 }
 
 const CSS = `
@@ -116,7 +121,29 @@ export async function mountPrompts(host?: HTMLElement) {
     stateEl.className = err ? 'state err' : 'state'
   }
 
-  let store: Store = { active: '', prompts: [] }
+  let store: Store = { active: '', active_prep: '', prompts: [] }
+
+  /**
+   * Whether a prep note is active, which decides WHICH of the two pointers a
+   * recording started now would resolve.
+   *
+   * Fetched from /prep rather than assumed: the header chip is the
+   * one-glance answer to "what happens next", and that is not knowable from
+   * this store alone.
+   */
+  let hasPrep = false
+
+  async function loadPrepState() {
+    try {
+      const r = await fetch(restUrl('/prep'))
+      if (!r.ok) { hasPrep = false; return }
+      const d = (await r.json()) as { active: string; prep: { id: string }[] }
+      // Mirrors PrepStore.active_prep(): resolve the pointer, NO fallback.
+      hasPrep = !!d.prep.find(q => q.id === d.active)
+    } catch {
+      hasPrep = false
+    }
+  }
 
   /** id currently open in the editor, '' for the list, 'new' for a draft. */
   let editing = ''
@@ -135,6 +162,7 @@ export async function mountPrompts(host?: HTMLElement) {
 
   async function load() {
     store = await call('/prompts')
+    await loadPrepState()
   }
 
   /**
@@ -161,6 +189,19 @@ export async function mountPrompts(host?: HTMLElement) {
     return p ? p.title : null
   }
 
+  /**
+   * Title used for prep-attached recordings, and whether it is a separate
+   * choice. Mirrors PromptStore.active_prompt(has_prep=True): the prep
+   * pointer wins only when set AND resolving, else falls through.
+   */
+  function prepTitle(): { title: string | null; separate: boolean } {
+    if (store.active_prep) {
+      const p = store.prompts.find(q => q.id === store.active_prep)
+      if (p) return { title: p.title, separate: true }
+    }
+    return { title: effectiveTitle(), separate: false }
+  }
+
   /** The header chip is a few centimetres wide; a 80-char title is not. */
   function ellipsis(s: string, max: number): string {
     return s.length <= max ? s : `${s.slice(0, max - 1).trimEnd()}…`
@@ -176,9 +217,16 @@ export async function mountPrompts(host?: HTMLElement) {
     // Empty store: the gateway is falling back to the env seed, and its label
     // is then the whole answer to "what is being sent", so it is shown as-is.
     const who = effectiveTitle() ?? store.effective.label
-    effWho.textContent = `${who} · ${store.effective.chars} chars`
-    chip.textContent = ellipsis(who, 18)
-    chip.className = 'chip info'
+    const prep = prepTitle()
+    effWho.textContent =
+      `${who} · ${store.effective.chars} chars` +
+      (prep.separate ? ` — with a prep note: ${prep.title}` : '')
+
+    // THE CHIP SHOWS WHAT WOULD ACTUALLY BE SENT, which depends on whether a
+    // prep note is attached - not the default pointer unconditionally.
+    const shown = (hasPrep ? prep.title : who) ?? who
+    chip.textContent = ellipsis(shown, 18)
+    chip.className = hasPrep && prep.separate ? 'chip ok' : 'chip info'
   }
 
   // ------------------------------------------------------------- editor
@@ -286,9 +334,15 @@ export async function mountPrompts(host?: HTMLElement) {
       row.innerHTML = `
         <span class="ttl"></span>
         <span class="meta"></span>
-        <div class="tags">${on ? '<span class="chip ok">Active</span>' : ''}</div>
+        <div class="tags">
+          ${on ? '<span class="chip ok">Default</span>' : ''}
+          ${p.id === store.active_prep ? '<span class="chip info">Lessons</span>' : ''}
+        </div>
         <div class="btns">
-          ${on ? '' : `<button class="btn sm primary use" type="button">${icon('check')}<span>Use this</span></button>`}
+          ${on ? '' : `<button class="btn sm primary use" type="button">${icon('check')}<span>Use as default</span></button>`}
+          ${p.id === store.active_prep
+            ? `<button class="btn sm ghost unprep" type="button">Stop using for lessons</button>`
+            : `<button class="btn sm useprep" type="button">${icon('check')}<span>Use for lessons</span></button>`}
           <button class="btn sm edit" type="button">${icon('edit')}<span>Edit</span></button>
         </div>`
 
@@ -297,16 +351,37 @@ export async function mountPrompts(host?: HTMLElement) {
       ;(row.querySelector('.ttl') as HTMLElement).textContent = p.title
       ;(row.querySelector('.meta') as HTMLElement).textContent = `${p.text.length} chars`
 
+      const activate = async (slot: 'default' | 'prep') => {
+        try {
+          await call(`/prompts/${p.id}/activate?slot=${slot}`, { method: 'POST' })
+          await load()
+          render()
+          notifySetupChanged()
+          say(slot === 'prep' ? 'set for lessons' : 'set as default')
+        } catch (e) {
+          say(`activate failed: ${(e as Error).message}`, true)
+        }
+      }
+
       const use = row.querySelector('.use') as HTMLButtonElement | null
-      if (use) {
-        use.onclick = async () => {
+      if (use) use.onclick = () => void activate('default')
+
+      const useprep = row.querySelector('.useprep') as HTMLButtonElement | null
+      if (useprep) useprep.onclick = () => void activate('prep')
+
+      const unprep = row.querySelector('.unprep') as HTMLButtonElement | null
+      if (unprep) {
+        unprep.onclick = async () => {
+          // Clears the pointer only. The prompt stays in the library and
+          // prep-attached recordings fall back to the default.
           try {
-            await call(`/prompts/${p.id}/activate`, { method: 'POST' })
+            await call('/prompts/deactivate-prep', { method: 'POST' })
             await load()
             render()
-            say('active prompt changed')
+            notifySetupChanged()
+            say('lessons will use the default prompt')
           } catch (e) {
-            say(`activate failed: ${(e as Error).message}`, true)
+            say(`failed: ${(e as Error).message}`, true)
           }
         }
       }
@@ -336,6 +411,12 @@ export async function mountPrompts(host?: HTMLElement) {
     editing = 'new'
     render()
   }
+
+  // Activating a lesson in the prep panel changes which pointer this card
+  // resolves, so the chip has to follow it.
+  window.addEventListener(SETUP_CHANGED, () => {
+    void loadPrepState().then(render)
+  })
 
   try {
     await load()
